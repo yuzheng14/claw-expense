@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag, runner, and install Rust
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy --target aarch64-apple-darwin
+          rustc +1.98.0 --version
+
+      - name: Check formatting
+        run: cargo +1.98.0 fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo +1.98.0 check --locked --all-targets --target aarch64-apple-darwin
+
+      - name: Test
+        run: cargo +1.98.0 test --locked --target aarch64-apple-darwin
+
+      - name: Clippy
+        run: cargo +1.98.0 clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      - name: Test Skill installer
+        run: /bin/bash tests/install.sh
+
+      - name: Build release binary
+        run: cargo +1.98.0 build --release --locked --target aarch64-apple-darwin
+
+      - name: Verify packaging
+        run: /bin/bash tests/package-release.sh
+
+      - name: Package release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: /bin/bash scripts/package-release.sh "$RELEASE_TAG"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download checked release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "dist/claw-expense-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz" \
+            "dist/claw-expense-skill-${RELEASE_TAG}.tar.gz" \
+            dist/SHA256SUMS \
+            --repo "$GH_REPO" \
+            --verify-tag \
+            --title "claw-expense ${RELEASE_TAG}" \
+            --generate-notes

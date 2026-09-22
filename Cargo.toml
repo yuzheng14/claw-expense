@@ -1,0 +1,26 @@
+[package]
+name = "claw-expense"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "An exact-money, local-first bookkeeping CLI for OpenClaw"
+license = "MIT"
+repository = "https://github.com/yuzheng14/claw-expense"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+directories = "6"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+thiserror = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "fs"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+strip = true

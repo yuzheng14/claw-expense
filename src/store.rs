@@ -298,6 +298,7 @@ impl Store {
         } else {
             (None, None, 0)
         };
+        let foreign_expense = crate::foreign::find_by_transaction(&mut tx, id).await?;
         tx.commit().await?;
         Ok(TransactionDetail {
             transaction,
@@ -306,6 +307,7 @@ impl Store {
             net_expense: net,
             refund_status: status,
             excess_refund: format_minor(excess),
+            foreign_expense,
         })
     }
 
@@ -357,7 +359,8 @@ impl Store {
             "SELECT t.kind, t.amount_minor, COALESCE(t.category, original.category) AS category FROM transactions t LEFT JOIN transactions original ON t.original_id = original.id",
         );
         push_filters(&mut query, filters, false);
-        let mut rows = query.build().fetch(&self.pool);
+        let mut tx = self.pool.begin().await?;
+        let mut rows = query.build().fetch(&mut *tx);
         let mut totals = Totals::default();
         let mut categories: BTreeMap<String, Totals> = BTreeMap::new();
         let mut count = 0_i64;
@@ -371,6 +374,10 @@ impl Store {
                 .add(kind, amount)?;
             count = count.checked_add(1).ok_or_else(overflow)?;
         }
+        drop(rows);
+        let (pending_count, pending_by_currency) =
+            crate::foreign::pending_totals(&mut tx, filters).await?;
+        tx.commit().await?;
         let by_category = categories
             .into_iter()
             .map(|(category, totals)| {
@@ -392,6 +399,8 @@ impl Store {
             net_expense: format_minor(totals.net()?),
             balance: format_minor(checked_sub(totals.income, totals.net()?)?),
             by_category,
+            pending_count,
+            pending_by_currency,
         })
     }
 
@@ -469,28 +478,28 @@ impl Store {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
-fn clean_optional(value: Option<String>) -> Option<String> {
+pub(crate) fn clean_optional(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 fn overflow() -> AppError {
     AppError::new("AMOUNT_OVERFLOW", "金额汇总超出可表示范围")
 }
-fn checked_add(left: i128, right: i128) -> Result<i128> {
+pub(crate) fn checked_add(left: i128, right: i128) -> Result<i128> {
     left.checked_add(right).ok_or_else(overflow)
 }
 fn checked_sub(left: i128, right: i128) -> Result<i128> {
     left.checked_sub(right).ok_or_else(overflow)
 }
-fn validate_amount(amount: Money) -> Result<()> {
+pub(crate) fn validate_amount(amount: Money) -> Result<()> {
     if amount.minor() <= 0 {
         return Err(AppError::invalid("单笔金额必须大于零"));
     }
     Ok(())
 }
-fn validate_request_id(id: Option<&str>) -> Result<()> {
+pub(crate) fn validate_request_id(id: Option<&str>) -> Result<()> {
     if id.is_some_and(|id| id.trim().is_empty() || id.len() > 200) {
         return Err(AppError::invalid(
             "request-id 必须为 1..200 字节的非空字符串",
@@ -498,7 +507,7 @@ fn validate_request_id(id: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-fn validate_date(value: &str) -> Result<()> {
+pub(crate) fn validate_date(value: &str) -> Result<()> {
     if value.len() != 10
         || !value.bytes().enumerate().all(|(i, byte)| {
             if i == 4 || i == 7 {
@@ -516,7 +525,7 @@ fn validate_date(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_filters(filters: &Filters) -> Result<()> {
+pub(crate) fn validate_filters(filters: &Filters) -> Result<()> {
     if let Some(month) = &filters.month {
         if month.len() != 7 {
             return Err(AppError::invalid("月份必须为 YYYY-MM"));
@@ -567,7 +576,11 @@ fn push_filters(query: &mut QueryBuilder<Sqlite>, filters: &Filters, include_voi
             .push_bind(keyword)
             .push(") > 0 OR instr(COALESCE(t.channel, ''), ")
             .push_bind(keyword)
-            .push(") > 0)");
+            .push(") > 0 OR EXISTS (SELECT 1 FROM pending_expenses p WHERE (p.transaction_id = t.id OR p.transaction_id = t.original_id) AND (instr(COALESCE(p.merchant, ''), ")
+            .push_bind(keyword)
+            .push(") > 0 OR instr(p.id, ")
+            .push_bind(keyword)
+            .push(") > 0)))");
     }
 }
 
@@ -587,7 +600,10 @@ fn decode_record(row: &SqliteRow) -> Result<TransactionRecord> {
         updated_at: row.try_get("updated_at")?,
     })
 }
-async fn fetch_record(conn: &mut SqliteConnection, id: &str) -> Result<TransactionRecord> {
+pub(crate) async fn fetch_record(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<TransactionRecord> {
     let mut query = QueryBuilder::<Sqlite>::new(SELECT_RECORD);
     query.push(" WHERE t.id = ").push_bind(id);
     let row = query
@@ -597,7 +613,11 @@ async fn fetch_record(conn: &mut SqliteConnection, id: &str) -> Result<Transacti
         .ok_or_else(|| AppError::new("NOT_FOUND", format!("账单不存在：{id}")))?;
     decode_record(&row)
 }
-async fn require_category(conn: &mut SqliteConnection, name: &str, kind: Kind) -> Result<()> {
+pub(crate) async fn require_category(
+    conn: &mut SqliteConnection,
+    name: &str,
+    kind: Kind,
+) -> Result<()> {
     let existing: Option<String> = sqlx::query_scalar("SELECT kind FROM categories WHERE name = ?")
         .bind(name)
         .fetch_optional(conn)
@@ -609,7 +629,7 @@ async fn require_category(conn: &mut SqliteConnection, name: &str, kind: Kind) -
     }
     Ok(())
 }
-async fn audit(
+pub(crate) async fn audit(
     conn: &mut SqliteConnection,
     action: &str,
     before: Option<&TransactionRecord>,
@@ -658,11 +678,11 @@ async fn replay(
     result.replayed = true;
     Ok(Some(result))
 }
-async fn save_request(
+pub(crate) async fn save_request<T: serde::Serialize>(
     conn: &mut SqliteConnection,
     request_id: Option<&str>,
     payload: &str,
-    result: &WriteResult,
+    result: &T,
 ) -> Result<()> {
     if let Some(id) = request_id {
         sqlx::query("INSERT INTO idempotency (request_id, payload, response_json, created_at) VALUES (?, ?, ?, ?)")

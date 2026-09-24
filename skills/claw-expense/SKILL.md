@@ -1,6 +1,6 @@
 ---
 name: claw-expense
-description: 使用 claw-expense CLI 记录人民币收入、支出和关联退款，查询或修正个人账单。适用于日常记账、朋友代付报销和月度收支查询。
+description: 使用 claw-expense CLI 记录人民币收支、关联退款及待确认人民币金额的外币消费，查询或修正账单。适用于日常记账、代付报销、外币账单补录和待确认提醒。
 license: MIT
 metadata:
   openclaw:
@@ -61,10 +61,19 @@ bash "{baseDir}/scripts/run.sh" --json list --month 2026-09
 
 退款省略 `category`，分类继承原支出；收款渠道独立于原支付渠道。允许部分、多次以及超额退款：支出 98 元、退回 100 元，净支出为 -2 元，不拆成额外收入。
 
+## 外币待确认账单
+
+遇到外币消费但人民币金额尚未确定，或用户要补齐人民币金额、取消/延后提醒时，读取 [references/pending-expenses.md](references/pending-expenses.md)。不要估算成人民币、填 0 元或只记在聊天记忆里。
+
+首次使用此流程先通过包装脚本执行 `pending --help` 检查 CLI 能力。若不支持，应说明需要包含此功能的新版 CLI，不能改用人民币命令硬记。当前发布的 `v0.1.0` 不含此功能；未发版的开发分支需先构建 CLI 并放入 PATH，再使用本 Skill。安装器不会自动覆盖已有 CLI。
+
+自动提醒需要另行配置 OpenClaw 定时任务；仅安装 Skill 或创建待确认记录不会启动后台提醒。用户要求设置提醒时，按上述参考中的配置流程处理，不在本机擅自配置远端 OpenClaw。
+
 ## 查询与纠错
 
 - `list --month YYYY-MM`：查询账单，注意分页返回的 `total`，不能将一页当全部账单。
 - `summary --month YYYY-MM`：由 CLI 计算收入、支出、退款、净支出和分类汇总，直接使用返回的金额字符串。
+- 汇总中的 `pending_count` / `pending_by_currency` 是同一消费期间尚未确认的外币账单，不计入人民币总额；有待确认记录时必须同时告知用户统计尚不完整，不跨币种相加。
 - 月报按各条账单的实际发生日期，`show` 的原单净支出则包含所有未作废关联退款，因此跨月时两者统计范围不同。
 - `edit <ID> --amount/--date/--category/--note/--channel`：按用户的纠错要求修改，修改后出现超额退款合法。
 - `void <ID>`：作废并保留历史；原单有关联退款时需用户意图涵盖这些退款，才使用 `--cascade-refunds` 一并作废。

@@ -90,6 +90,8 @@ pub struct TransactionDetail {
     pub net_expense: Option<String>,
     pub refund_status: Option<String>,
     pub excess_refund: String,
+    #[serde(default)]
+    pub foreign_expense: Option<PendingExpenseRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,6 +134,94 @@ pub struct Summary {
     pub net_expense: String,
     pub balance: String,
     pub by_category: Vec<CategorySummary>,
+    pub pending_count: i64,
+    pub pending_by_currency: Vec<PendingCurrencySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewPendingExpense {
+    pub currency: String,
+    pub amount: String,
+    pub date: String,
+    pub category: Option<String>,
+    pub merchant: Option<String>,
+    pub note: Option<String>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmPendingExpense {
+    pub amount: Money,
+    pub posted_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingExpenseRecord {
+    pub id: String,
+    pub currency: String,
+    pub amount: String,
+    pub date: String,
+    pub category: String,
+    pub merchant: Option<String>,
+    pub note: Option<String>,
+    pub channel: Option<String>,
+    pub status: String,
+    pub remind_on: String,
+    pub transaction_id: Option<String>,
+    pub confirmed_at: Option<String>,
+    pub posted_date: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingWriteResult {
+    pub pending: PendingExpenseRecord,
+    pub transaction: Option<TransactionRecord>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFilters {
+    pub filters: Filters,
+    pub status: Option<String>,
+    pub currency: Option<String>,
+    pub as_of: String,
+    pub due_only: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingListResult {
+    pub items: Vec<PendingExpenseRecord>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub as_of: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingDetail {
+    pub pending: PendingExpenseRecord,
+    pub transaction: Option<TransactionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingCurrencySummary {
+    pub currency: String,
+    pub amount: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingAuditRecord {
+    pub id: i64,
+    pub pending_id: String,
+    pub action: String,
+    pub before: Option<serde_json::Value>,
+    pub after: serde_json::Value,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

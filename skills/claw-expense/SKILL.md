@@ -27,6 +27,7 @@ bash "{baseDir}/scripts/run.sh" --json list --month 2026-09
 - 默认安装目录为 `~/.local/bin`。可以通过 `CLAW_EXPENSE_INSTALL_DIR` 指定可写目录，脚本不改 shell 配置；即使该目录不在 PATH，包装脚本仍可正常执行。
 - `CLAW_EXPENSE_VERSION=vX.Y.Z` 仅改变缺失 CLI 时下载的版本，不自动升级或覆盖已有 CLI。
 - 所有 CLI 参数、stdin 和退出码原样传递。安装诊断写入 stderr，不污染 stdout 中的业务 JSON。
+- CLI 可能向 stderr 输出 `[WARN] 有更新可用`，这不代表记账失败。仍以退出码和 stdout 的 `ok` 判定结果，不能因提醒重试记账或自行升级。用户要求完全关闭更新检查时，传入 `--no-update-check` 或设置 `CLAW_EXPENSE_NO_UPDATE_CHECK=1`；该功能仅提供版本提醒，不会更新已有 CLI。
 - 下载来源固定为 `https://github.com/yuzheng14/claw-expense/releases`。网络失败或不支持的平台应如实报告，不能改用未知来源或跳过校验。
 - 安装和执行发生在 `exec` 所在的机器。Linux 容器或 Intel Mac 不支持自动安装当前 ARM64 包。
 

@@ -19,6 +19,8 @@ use claw_expense::{
 };
 use serde_json::{Value, json};
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     name = "claw-expense",
@@ -30,6 +32,14 @@ struct Cli {
     db: Option<PathBuf>,
     #[arg(long, global = true, help = "输出结构化 JSON；金额始终为字符串")]
     json: bool,
+    #[arg(
+        long,
+        global = true,
+        env = "CLAW_EXPENSE_NO_UPDATE_CHECK",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help = "关闭新版检查和提醒，不访问网络或更新检查缓存"
+    )]
+    no_update_check: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -788,5 +798,14 @@ async fn main() -> ExitCode {
         }
     };
     let json_output = cli.json;
-    emit(run(cli).await, json_output)
+    let no_update_check = cli.no_update_check;
+    // Finish the actual operation and emit its result before this best-effort check.
+    // A notice must never change a write's success status or contaminate stdout JSON.
+    let result = run(cli).await;
+    let succeeded = result.is_ok();
+    let exit_code = emit(result, json_output);
+    if succeeded && !no_update_check {
+        update::warn_if_available().await;
+    }
+    exit_code
 }

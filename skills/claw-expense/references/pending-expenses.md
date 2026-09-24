@@ -10,7 +10,7 @@
 {"currency":"JPY","amount":"10000","date":"2026-09-30","merchant":"乐天","category":"购物","channel":"招行信用卡","note":"海淘"}
 ```
 
-- 支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD（最多两位小数），JPY、KRW（整数）；未支持的币种应如实说明，不猜测精度或转换金额。
+- 支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（最多两位小数），JPY、KRW（整数）；“新台币”或“台币”使用 `TWD`，例如 `{"currency":"TWD","amount":"1234.56","date":"2026-09-24"}`。未支持的币种应如实说明，不猜测精度或转换金额。
 - 记录处于 `pending` 状态，返回 `pending.id`。`pending.amount` 始终是原币金额；`transaction: null` 表示没有人民币支出，不是零元支出。
 - 默认 `remind_on` 为消费日后 3 个日历日。这只是 CLI 的查询条件，不表示已建立主动提醒。
 - 查询用 `pending list`，默认只列待确认，按消费日期由旧到新。支持月份、日期范围、币种、分类、搜索和分页；不要用第一页代表全部记录。

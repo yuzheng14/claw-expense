@@ -130,6 +130,191 @@ fn currency_total<'a>(summary: &'a Value, currency: &str) -> &'a Value {
 }
 
 #[test]
+fn twd_records_use_exact_two_decimal_amounts_and_confirm_without_duplicate_cny() {
+    let ledger = Ledger::new();
+    let mut record = json!({
+        "currency": "TWD", "amount": "1234.56", "date": "2026-09-24",
+        "category": CATEGORY, "merchant": "台湾海淘", "channel": "信用卡"
+    });
+    let args = ["pending", "record", "--request-id", "twd-purchase"];
+    let added = success(run_at(&ledger.db, &args, Some(&record.to_string())));
+    assert_eq!(added["pending"]["currency"], "TWD");
+    assert_eq!(added["pending"]["amount"], "1234.56");
+    assert!(added["transaction"].is_null());
+    record["amount"] = json!("001234.56");
+    let replayed = success(run_at(&ledger.db, &args, Some(&record.to_string())));
+    assert_eq!(replayed["replayed"], true);
+    assert_eq!(replayed["pending"], added["pending"]);
+
+    let cent = ledger.add("TWD", "0.01", "2026-09-24");
+    assert_eq!(cent["pending"]["amount"], "0.01");
+    ledger.add("USD", "20", "2026-09-24");
+    ledger.error(&[
+        "pending",
+        "add",
+        "--currency",
+        "TWD",
+        "--amount",
+        "1.001",
+        "--date",
+        "2026-09-24",
+    ]);
+    record["amount"] = json!(1234.56);
+    failure(run_at(
+        &ledger.db,
+        &["pending", "record"],
+        Some(&record.to_string()),
+    ));
+    let before = ledger.ok(&["summary"]);
+    assert_eq!(before["pending_count"], 3);
+    assert_eq!(before["expense"], "0.00");
+    assert_eq!(currency_total(&before, "TWD")["amount"], "1234.57");
+    assert_eq!(currency_total(&before, "TWD")["count"], 2);
+    let filtered = ledger.ok(&["pending", "list", "--currency", "TWD"]);
+    assert_eq!(filtered["total"], 2);
+    assert!(
+        filtered["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["currency"] == "TWD")
+    );
+
+    let confirm_args = [
+        "pending",
+        "confirm",
+        pending_id(&added),
+        "--amount",
+        "278.91",
+        "--posted-date",
+        "2026-09-28",
+        "--request-id",
+        "twd-confirm",
+    ];
+    let confirmed = ledger.ok(&confirm_args);
+    let confirm_replay = ledger.ok(&confirm_args);
+    assert_eq!(confirm_replay["replayed"], true);
+    assert_eq!(confirm_replay["transaction"], confirmed["transaction"]);
+    assert_eq!(confirmed["transaction"]["currency"], "CNY");
+    assert_eq!(confirmed["transaction"]["amount"], "278.91");
+    assert_eq!(confirmed["pending"]["currency"], "TWD");
+    assert_eq!(confirmed["pending"]["amount"], "1234.56");
+    let detail = ledger.ok(&["show", transaction_id(&confirmed)]);
+    assert_eq!(detail["foreign_expense"]["currency"], "TWD");
+    assert_eq!(detail["foreign_expense"]["amount"], "1234.56");
+    assert_eq!(ledger.ok(&["list"])["total"], 1);
+    let after = ledger.ok(&["summary"]);
+    assert_eq!(after["count"], 1);
+    assert_eq!(after["expense"], "278.91");
+    assert_eq!(currency_total(&after, "TWD")["amount"], "0.01");
+    assert_eq!(currency_total(&after, "TWD")["count"], 1);
+}
+
+#[test]
+fn twd_backup_restore_and_export_preserve_amounts_precision_and_request_history() {
+    let ledger = Ledger::new();
+    let added = ledger.add("TWD", "1234.56", "2026-09-24");
+    let confirmation = [
+        "pending",
+        "confirm",
+        pending_id(&added),
+        "--amount",
+        "278.91",
+        "--request-id",
+        "twd-backup-confirm",
+    ];
+    let confirmed = ledger.ok(&confirmation);
+    let waiting = ledger.add("TWD", "0.01", "2026-09-25");
+    ledger.ok(&[
+        "pending",
+        "snooze",
+        pending_id(&waiting),
+        "--until",
+        "2026-10-01",
+    ]);
+    let list = ledger.ok(&[
+        "pending",
+        "list",
+        "--status",
+        "all",
+        "--currency",
+        "TWD",
+        "--as-of",
+        "2026-10-01",
+    ]);
+    let history = ledger.ok(&["pending", "history", pending_id(&added)]);
+    let detail = ledger.ok(&["show", transaction_id(&confirmed)]);
+    let summary = ledger.ok(&["summary"]);
+    let backup = ledger.directory.path().join("twd-backup.sqlite3");
+    ledger.ok(&["backup", "--output", backup.to_str().unwrap()]);
+    let restored_db = ledger.directory.path().join("twd-restored.sqlite3");
+    success(run_at(
+        &restored_db,
+        &["restore", "--input", backup.to_str().unwrap()],
+        None,
+    ));
+    let restored = |args: &[&str]| success(run_at(&restored_db, args, None));
+    assert_eq!(
+        restored(&[
+            "pending",
+            "list",
+            "--status",
+            "all",
+            "--currency",
+            "TWD",
+            "--as-of",
+            "2026-10-01"
+        ]),
+        list
+    );
+    assert_eq!(
+        restored(&["pending", "history", pending_id(&added)]),
+        history
+    );
+    assert_eq!(restored(&["show", transaction_id(&confirmed)]), detail);
+    assert_eq!(restored(&["summary"]), summary);
+    assert_eq!(restored(&confirmation)["replayed"], true);
+    assert_eq!(restored(&["list"])["total"], 1);
+
+    let export = ledger.directory.path().join("twd-export.json");
+    restored(&["export", "--output", export.to_str().unwrap()]);
+    let exported: Value = serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
+    assert_eq!(
+        exported["amount_units"]["pending_expenses.amount_minor"]["exponents"]["TWD"],
+        2
+    );
+    let rows = exported["tables"]["pending_expenses"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let original = rows
+        .iter()
+        .find(|row| row["id"] == pending_id(&added))
+        .unwrap();
+    assert_eq!(original["currency"], "TWD");
+    assert_eq!(original["amount_minor"], "123456");
+    assert_eq!(original["confirmed_amount_minor"], "27891");
+    let cent = rows
+        .iter()
+        .find(|row| row["id"] == pending_id(&waiting))
+        .unwrap();
+    assert_eq!(cent["amount_minor"], "1");
+    assert!(cent["confirmed_amount_minor"].is_null());
+    assert_eq!(
+        exported["tables"]["pending_audit_log"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        exported["tables"]["idempotency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["request_id"] == "twd-backup-confirm")
+    );
+}
+
+#[test]
 fn pending_purchase_has_no_cny_amount_until_confirmed_and_retains_both_dates() {
     let ledger = Ledger::new();
     let added = ledger.ok(&[

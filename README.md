@@ -129,7 +129,9 @@ claw-expense pending list --status confirmed --json
 claw-expense pending history <待确认ID> --json
 ```
 
-原币支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD（最多两位小数），JPY、KRW（整数）。原币金额使用对应币种的整数最小单位，单笔最大 `i64::MAX` 个最小单位，分类汇总采用受检 `i128`；所有 JSON 金额仍为字符串。不支持的币种及多余小数会明确拒绝，不做隐式换算或舍入。人民币确认金额沿用上文的精确到分规则。
+原币支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（新台币，最多两位小数），JPY、KRW（整数）。原币金额使用对应币种的整数最小单位，单笔最大 `i64::MAX` 个最小单位，分类汇总采用受检 `i128`；所有 JSON 金额仍为字符串。不支持的币种及多余小数会明确拒绝，不做隐式换算或舍入。人民币确认金额沿用上文的精确到分规则。
+
+例如新台币消费可以记录为 `pending add --currency TWD --amount 1234.56 --date 2026-09-24`；之后仍通过 `pending confirm` 补齐实际人民币金额。
 
 Agent 可以从 stdin 用 `pending record` 传 JSON，避免拼接用户文本：
 

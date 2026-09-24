@@ -28,6 +28,7 @@ pub const SUPPORTED_CURRENCIES: &[(&str, u32)] = &[
     ("CHF", 2),
     ("NZD", 2),
     ("KRW", 0),
+    ("TWD", 2),
 ];
 
 /// Supported ISO 4217 minor-unit precision. Deliberately rejects CNY and unknown codes.
@@ -38,7 +39,7 @@ pub fn currency_digits(currency: &str) -> Result<u32> {
         .map(|(_, digits)| *digits)
         .ok_or_else(|| {
             AppError::invalid(
-                "外币必须为 USD、JPY、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD 或 KRW（大写）",
+                "外币必须为 USD、JPY、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、KRW 或 TWD（大写）",
             )
         })
 }
@@ -599,6 +600,9 @@ mod tests {
             ("USD", "0.10", 10),
             ("USD", "90071992547409.93", 9_007_199_254_740_993),
             ("USD", "92233720368547758.07", i64::MAX),
+            ("TWD", "1234.56", 123456),
+            ("TWD", "0.01", 1),
+            ("TWD", "92233720368547758.07", i64::MAX),
             ("JPY", "9223372036854775807", i64::MAX),
             ("KRW", "1000", 1000),
             ("JPY", "00100", 100),
@@ -621,6 +625,10 @@ mod tests {
             ("USD", "1e2"),
             ("JPY", "9223372036854775808"),
             ("USD", "92233720368547758.08"),
+            ("TWD", "1.001"),
+            ("TWD", "0"),
+            ("TWD", "1e2"),
+            ("TWD", "92233720368547758.08"),
             ("CNY", "1"),
             ("BTC", "1"),
             ("usd", "1"),

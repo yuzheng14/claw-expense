@@ -10,7 +10,8 @@
 {"currency":"JPY","amount":"10000","date":"2026-09-30","merchant":"乐天","category":"购物","channel":"招行信用卡","note":"海淘"}
 ```
 
-- 支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（最多两位小数），JPY、KRW（整数）；“新台币”或“台币”使用 `TWD`，例如 `{"currency":"TWD","amount":"1234.56","date":"2026-09-24"}`。未支持的币种应如实说明，不猜测精度或转换金额。
+- 支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（最多两位小数），JPY、KRW（仅整数）；新台币（通常简称台币）使用 `TWD`，例如 `{"currency":"TWD","amount":"1234.56","date":"2026-09-24"}`。未支持的币种应如实说明，不猜测精度或转换金额。
+- JPY、KRW 的输入不能带小数点，`1000.0` / `1000.00` 也会被拒绝。始终向 CLI 传原币金额字符串，例如 `"1000"`；CLI 在内部将所有币种统一乘 100 存为整数，并校验这两种币的存储值为 100 的倍数。不要在 Skill 中预先乘 100；列表与业务 JSON 仍返回原币金额，只有原始归档中的 `amount_minor` 是缩放后的整数。
 - 记录处于 `pending` 状态，返回 `pending.id`。`pending.amount` 始终是原币金额；`transaction: null` 表示没有人民币支出，不是零元支出。
 - 知道消费时间时，JSON 可追加 `occurred_at`（如 `2026-09-30T14:35+08:00`）；遵循 SKILL.md 的时区和精度规则，`date` 仍必填且与时间当地日期一致。只知道日期时省略时间，不伪造凌晨零点。确认人民币金额会复制原消费时间，不改为确认时刻。
 - 默认 `remind_on` 为消费日后 3 个日历日。这只是 CLI 的查询条件，不表示已建立主动提醒。

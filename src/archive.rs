@@ -205,8 +205,8 @@ pub async fn export(store: &Store, output: &Path) -> Result<()> {
             "pending_expenses.confirmed_amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
             "pending_expenses.amount_minor": {
                 "currency_column": "currency",
-                "unit": "currency_minor",
-                "exponents": crate::foreign::SUPPORTED_CURRENCIES.iter().copied().collect::<std::collections::BTreeMap<_, _>>()
+                "unit": "currency_hundredth",
+                "exponent": crate::foreign::FOREIGN_STORAGE_EXPONENT
             }
         },
         "integer_encoding": "decimal_string",

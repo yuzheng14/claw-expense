@@ -17,6 +17,10 @@ use crate::{
     },
 };
 
+/// All stored amounts use hundredths, regardless of their input precision.
+pub const FOREIGN_STORAGE_EXPONENT: u32 = 2;
+
+/// Supported currencies and their allowed input decimal places, not storage scales.
 pub const SUPPORTED_CURRENCIES: &[(&str, u32)] = &[
     ("USD", 2),
     ("JPY", 0),
@@ -32,12 +36,11 @@ pub const SUPPORTED_CURRENCIES: &[(&str, u32)] = &[
     ("TWD", 2),
 ];
 
-/// Supported ISO 4217 minor-unit precision. Deliberately rejects CNY and unknown codes.
-pub fn currency_digits(currency: &str) -> Result<u32> {
+fn supported_currency(currency: &str) -> Result<(&'static str, u32)> {
     SUPPORTED_CURRENCIES
         .iter()
         .find(|(code, _)| *code == currency)
-        .map(|(_, digits)| *digits)
+        .copied()
         .ok_or_else(|| {
             AppError::invalid(
                 "外币必须为 USD、JPY、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、KRW 或 TWD（大写）",
@@ -45,33 +48,90 @@ pub fn currency_digits(currency: &str) -> Result<u32> {
         })
 }
 
-pub fn parse_foreign_minor(currency: &str, amount: &str) -> Result<i64> {
-    let digits = currency_digits(currency)?;
-    let minor = if digits == 2 {
-        amount.parse::<Money>()?.minor()
-    } else {
-        if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(AppError::invalid("JPY/KRW 金额必须为无小数的正整数字符串"));
-        }
-        amount.bytes().try_fold(0_i64, |value, byte| {
-            value
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(i64::from(byte - b'0')))
-                .ok_or_else(|| AppError::invalid("原币金额超出可表示范围"))
-        })?
-    };
-    if minor <= 0 {
-        return Err(AppError::invalid("原币金额必须大于零"));
-    }
-    Ok(minor)
+/// Input precision is independent of the fixed two-decimal storage scale.
+/// Deliberately rejects CNY and unknown codes.
+pub fn currency_input_digits(currency: &str) -> Result<u32> {
+    supported_currency(currency).map(|(_, digits)| digits)
 }
 
+/// An exact, currency-tagged amount in hundredths. The wider accumulator keeps
+/// totals exact beyond the per-record i64 limit, without allowing mixed currencies.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ForeignAmount {
+    currency: &'static str,
+    input_digits: u32,
+    hundredths: i128,
+}
+
+impl ForeignAmount {
+    fn parse(currency: &str, amount: &str) -> Result<Self> {
+        let input_digits = currency_input_digits(currency)?;
+        if input_digits == 0
+            && (amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(AppError::invalid("JPY/KRW 金额必须为无小数的正整数字符串"));
+        }
+
+        // Reuse the exact decimal-string parser: every currency is scaled by 100.
+        // No floating-point multiplication or currency conversion is involved.
+        let hundredths = amount.parse::<Money>()?.minor();
+        if hundredths <= 0 {
+            return Err(AppError::invalid("原币金额必须大于零"));
+        }
+        Self::from_hundredths(currency, i128::from(hundredths))
+    }
+
+    fn from_hundredths(currency: &str, hundredths: i128) -> Result<Self> {
+        let (currency, input_digits) = supported_currency(currency)?;
+        if input_digits == 0 && hundredths % 100 != 0 {
+            return Err(AppError::new(
+                "INVALID_STORED_AMOUNT",
+                "JPY/KRW 存储金额必须为 100 的整数倍，不能截断小数",
+            ));
+        }
+        Ok(Self {
+            currency,
+            input_digits,
+            hundredths,
+        })
+    }
+
+    fn storage_minor(self) -> Result<i64> {
+        i64::try_from(self.hundredths)
+            .map_err(|_| AppError::new("AMOUNT_OVERFLOW", "原币金额超出存储范围"))
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self> {
+        if self.currency != other.currency {
+            return Err(AppError::new(
+                "CURRENCY_MISMATCH",
+                "不同币种的原币金额不能相加",
+            ));
+        }
+        Ok(Self {
+            hundredths: checked_add(self.hundredths, other.hundredths)?,
+            ..self
+        })
+    }
+
+    fn format(self) -> String {
+        if self.input_digits == 0 {
+            // The constructor guarantees exact divisibility, including totals.
+            (self.hundredths / 100).to_string()
+        } else {
+            crate::money::format_minor(self.hundredths)
+        }
+    }
+}
+
+/// Parse user-facing currency units into fixed hundredths for storage.
+pub fn parse_foreign_minor(currency: &str, amount: &str) -> Result<i64> {
+    ForeignAmount::parse(currency, amount)?.storage_minor()
+}
+
+/// Format fixed hundredths; zero-decimal currencies must be exactly divisible.
 pub fn format_foreign_minor(currency: &str, amount: i128) -> Result<String> {
-    Ok(if currency_digits(currency)? == 0 {
-        amount.to_string()
-    } else {
-        crate::money::format_minor(amount)
-    })
+    Ok(ForeignAmount::from_hundredths(currency, amount)?.format())
 }
 
 impl Store {
@@ -80,8 +140,8 @@ impl Store {
         mut input: NewPendingExpense,
         request_id: Option<&str>,
     ) -> Result<PendingWriteResult> {
-        let minor = parse_foreign_minor(&input.currency, &input.amount)?;
-        input.amount = format_foreign_minor(&input.currency, i128::from(minor))?;
+        let amount = ForeignAmount::parse(&input.currency, &input.amount)?;
+        input.amount = amount.format();
         input.occurred_at = validate_occurrence(&input.date, input.occurred_at.as_deref())?;
         validate_request_id(request_id)?;
         let remind_on = NaiveDate::parse_from_str(&input.date, "%Y-%m-%d")
@@ -104,7 +164,7 @@ impl Store {
         let id = format!("pending_{}", uuid::Uuid::new_v4().simple());
         let now = now();
         sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, occurred_at, category, merchant, note, channel, remind_on, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(&input.currency).bind(minor).bind(&input.date).bind(&input.occurred_at).bind(category)
+            .bind(&id).bind(&input.currency).bind(amount.storage_minor()?).bind(&input.date).bind(&input.occurred_at).bind(category)
             .bind(clean_optional(input.merchant)).bind(clean_optional(input.note))
             .bind(clean_optional(input.channel)).bind(remind_on).bind(&now).bind(&now)
             .execute(&mut *tx).await?;
@@ -291,7 +351,7 @@ impl Store {
         validate_filters(&filters.filters)?;
         validate_date(&filters.as_of)?;
         if let Some(currency) = &filters.currency {
-            currency_digits(currency)?;
+            currency_input_digits(currency)?;
         }
         let status = filters.status.as_deref().unwrap_or("pending");
         if !["pending", "confirmed", "cancelled", "all"].contains(&status) {
@@ -530,11 +590,16 @@ pub(crate) async fn pending_totals(
     push_pending_filters(&mut query, filters, "pending");
     let mut rows = query.build().fetch(conn);
     let mut count = 0_i64;
-    let mut totals: BTreeMap<String, (i128, i64)> = BTreeMap::new();
+    let mut totals: BTreeMap<String, (ForeignAmount, i64)> = BTreeMap::new();
     while let Some(row) = rows.try_next().await? {
         let currency: String = row.try_get("currency")?;
-        let (amount, entries) = totals.entry(currency).or_default();
-        *amount = checked_add(*amount, i128::from(row.try_get::<i64, _>("amount_minor")?))?;
+        let stored = ForeignAmount::from_hundredths(
+            &currency,
+            i128::from(row.try_get::<i64, _>("amount_minor")?),
+        )?;
+        let zero = ForeignAmount::from_hundredths(&currency, 0)?;
+        let (amount, entries) = totals.entry(currency).or_insert((zero, 0));
+        *amount = amount.checked_add(stored)?;
         *entries = entries
             .checked_add(1)
             .ok_or_else(|| AppError::new("AMOUNT_OVERFLOW", "账单数量溢出"))?;
@@ -544,14 +609,12 @@ pub(crate) async fn pending_totals(
     }
     let values = totals
         .into_iter()
-        .map(|(currency, (amount, count))| {
-            Ok(PendingCurrencySummary {
-                amount: format_foreign_minor(&currency, amount)?,
-                currency,
-                count,
-            })
+        .map(|(currency, (amount, count))| PendingCurrencySummary {
+            amount: amount.format(),
+            currency,
+            count,
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
     Ok((count, values))
 }
 
@@ -729,14 +792,17 @@ mod tests {
             ("TWD", "1234.56", 123456),
             ("TWD", "0.01", 1),
             ("TWD", "92233720368547758.07", i64::MAX),
-            ("JPY", "9223372036854775807", i64::MAX),
-            ("KRW", "1000", 1000),
-            ("JPY", "00100", 100),
+            ("JPY", "92233720368547758", 9_223_372_036_854_775_800),
+            ("KRW", "1000", 100000),
+            ("JPY", "00100", 10000),
         ] {
             assert_eq!(parse_foreign_minor(currency, input).unwrap(), expected);
         }
         for (currency, input) in [
             ("JPY", "1.0"),
+            ("JPY", "1.00"),
+            ("KRW", "1.0"),
+            ("KRW", "1.00"),
             ("KRW", "0.01"),
             ("JPY", "1e3"),
             ("JPY", "-1"),
@@ -749,7 +815,8 @@ mod tests {
             ("USD", "0.00"),
             ("USD", "1.001"),
             ("USD", "1e2"),
-            ("JPY", "9223372036854775808"),
+            ("JPY", "92233720368547759"),
+            ("JPY", "9223372036854775807"),
             ("USD", "92233720368547758.08"),
             ("TWD", "1.001"),
             ("TWD", "0"),
@@ -765,19 +832,99 @@ mod tests {
             );
         }
         assert_eq!(
-            format_foreign_minor("JPY", i128::MAX).unwrap(),
-            i128::MAX.to_string()
+            format_foreign_minor("JPY", i128::MAX - i128::MAX % 100).unwrap(),
+            (i128::MAX / 100).to_string()
         );
         for (currency, precision) in SUPPORTED_CURRENCIES {
-            assert_eq!(currency_digits(currency).unwrap(), *precision);
-            assert_eq!(
-                parse_foreign_minor(currency, "1").unwrap(),
-                if *precision == 0 { 1 } else { 100 }
-            );
+            assert_eq!(currency_input_digits(currency).unwrap(), *precision);
+            assert_eq!(parse_foreign_minor(currency, "1").unwrap(), 100);
         }
         let mut json = serde_json::to_value(input("USD", "10.00")).unwrap();
         json["amount"] = serde_json::json!(10.00);
         assert!(serde_json::from_value::<NewPendingExpense>(json).is_err());
+    }
+
+    #[test]
+    fn foreign_amounts_preserve_units_and_reject_invalid_storage() {
+        for currency in ["JPY", "KRW"] {
+            for (stored, displayed) in [(0, "0"), (100, "1"), (100000, "1000"), (-100, "-1")] {
+                assert_eq!(format_foreign_minor(currency, stored).unwrap(), displayed);
+            }
+            for stored in [1, 99, 101, -1, i128::MAX, i128::MIN] {
+                assert_eq!(
+                    format_foreign_minor(currency, stored).unwrap_err().code,
+                    "INVALID_STORED_AMOUNT"
+                );
+            }
+        }
+        assert_eq!(format_foreign_minor("USD", 101).unwrap(), "1.01");
+        assert_eq!(format_foreign_minor("TWD", -101).unwrap(), "-1.01");
+        assert!(format_foreign_minor("UNKNOWN", 100).is_err());
+        assert_eq!(FOREIGN_STORAGE_EXPONENT, 2);
+    }
+
+    #[test]
+    fn foreign_amount_addition_checks_currency_and_overflow() {
+        let yen = ForeignAmount::parse("JPY", "1000").unwrap();
+        let yen_total = yen.checked_add(yen).unwrap();
+        assert_eq!(yen_total.storage_minor().unwrap(), 200000);
+        assert_eq!(yen_total.format(), "2000");
+
+        let usd = ForeignAmount::parse("USD", "0.10").unwrap();
+        let usd_total = usd
+            .checked_add(ForeignAmount::parse("USD", "0.20").unwrap())
+            .unwrap();
+        assert_eq!(usd_total.storage_minor().unwrap(), 30);
+        assert_eq!(usd_total.format(), "0.30");
+        assert_eq!(yen.checked_add(usd).unwrap_err().code, "CURRENCY_MISMATCH");
+        assert_eq!(
+            yen.checked_add(ForeignAmount::parse("KRW", "1000").unwrap())
+                .unwrap_err()
+                .code,
+            "CURRENCY_MISMATCH"
+        );
+
+        let maximum = ForeignAmount::from_hundredths("USD", i128::MAX).unwrap();
+        let minimum = ForeignAmount::from_hundredths("USD", i128::MIN).unwrap();
+        for (value, increment) in [(maximum, 1), (minimum, -1)] {
+            assert_eq!(
+                value
+                    .checked_add(ForeignAmount::from_hundredths("USD", increment).unwrap())
+                    .unwrap_err()
+                    .code,
+                "AMOUNT_OVERFLOW"
+            );
+            assert_eq!(value.storage_minor().unwrap_err().code, "AMOUNT_OVERFLOW");
+        }
+
+        let maximum_yen =
+            ForeignAmount::from_hundredths("JPY", i128::MAX - i128::MAX % 100).unwrap();
+        assert_eq!(
+            maximum_yen
+                .checked_add(ForeignAmount::parse("JPY", "1").unwrap())
+                .unwrap_err()
+                .code,
+            "AMOUNT_OVERFLOW"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_foreign_currency_stores_hundredths() {
+        let (_dir, store) = ledger().await;
+        for (currency, digits) in SUPPORTED_CURRENCIES {
+            let result = store.add_pending(input(currency, "1"), None).await.unwrap();
+            let stored: i64 =
+                sqlx::query_scalar("SELECT amount_minor FROM pending_expenses WHERE id = ?")
+                    .bind(&result.pending.id)
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, 100, "{currency}");
+            assert_eq!(
+                result.pending.amount,
+                if *digits == 0 { "1" } else { "1.00" }
+            );
+        }
     }
 
     #[tokio::test]
@@ -1223,8 +1370,8 @@ mod tests {
     async fn pending_totals_are_i128_exact_separated_and_use_identical_filters() {
         let (_dir, store) = ledger().await;
         for (currency, amount) in [
-            ("JPY", "9223372036854775807"),
-            ("JPY", "9223372036854775807"),
+            ("JPY", "92233720368547758"),
+            ("JPY", "92233720368547758"),
             ("USD", "92233720368547758.07"),
             ("USD", "92233720368547758.07"),
         ] {
@@ -1236,10 +1383,7 @@ mod tests {
         let summary = store.summary(&Filters::default()).await.unwrap();
         assert_eq!(summary.pending_count, 4);
         assert_eq!(summary.pending_by_currency[0].currency, "JPY");
-        assert_eq!(
-            summary.pending_by_currency[0].amount,
-            "18446744073709551614"
-        );
+        assert_eq!(summary.pending_by_currency[0].amount, "184467440737095516");
         assert_eq!(
             summary.pending_by_currency[1].amount,
             "184467440737095516.14"

@@ -179,7 +179,11 @@ claw-expense pending list --status confirmed --json
 claw-expense pending history <待确认ID> --json
 ```
 
-原币支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（新台币，最多两位小数），JPY、KRW（整数）。原币金额使用对应币种的整数最小单位，单笔最大 `i64::MAX` 个最小单位，分类汇总采用受检 `i128`；所有 JSON 金额仍为字符串。不支持的币种及多余小数会明确拒绝，不做隐式换算或舍入。人民币确认金额沿用上文的精确到分规则。
+原币支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（新台币，最多两位小数），JPY、KRW（仅整数）。所有币种统一将金额乘 100，以货币单位的百分之一存为 `i64` 整数；分类汇总采用受检 `i128`，按币种分别计算，禁止跨币种相加。CLI 和业务 JSON 始终使用原币金额字符串，不传乘 100 后的存储值。
+
+JPY、KRW 的整数限制是独立的输入校验：仅接受无小数点的正整数字符串，`1000.0`、`1000.00` 也会被拒绝。输入 `1000` 时，数据库保存 `100000`，列表和业务 JSON 仍显示 `1000`；数据库约束保证这两种币的存储值始终为 100 的倍数，个位和十位均为 0。其他支持币种如输入 `12.34` 则保存 `1234`。超出允许精度的金额直接报错，不截断或舍入。
+
+两位小数币种的单笔上限为 `92233720368547758.07`，JPY、KRW 为 `92233720368547758`（乘 100 后仍须在 `i64` 范围内）。金额解析、格式化及外币汇总集中处理缩放和币种校验；人民币确认金额仍按整数分保存。
 
 例如新台币消费可以记录为 `pending add --currency TWD --amount 1234.56 --date 2026-09-24`；之后仍通过 `pending confirm` 补齐实际人民币金额。
 
@@ -298,7 +302,7 @@ claw-expense --db ./restored.sqlite summary
 
 所有输出和恢复目标都必须是新文件，不覆盖已有文件。恢复前检查应用标识、数据库版本、完整性和外键关系。SQLite 备份包含数据库结构、全部账单、审计历史和请求去重记录；使用一致性快照创建，包含已经提交的 WAL 数据。
 
-JSON 导出 v2 包含 `categories`、`transactions`、`audit_log`、`idempotency`、`pending_expenses`、`pending_audit_log` 六张业务表。人民币 `transactions.amount_minor` 单位为分；外币 `pending_expenses.amount_minor` 单位由对应币种精度决定。归档通过 `amount_units` 显式说明各字段单位；所有整数也编码为字符串，以保持大整数精度。JSON 导出暂不提供导入命令，恢复使用 SQLite 备份。
+JSON 导出 v2 包含 `categories`、`transactions`、`audit_log`、`idempotency`、`pending_expenses`、`pending_audit_log` 六张业务表。人民币 `transactions.amount_minor` 单位为分；外币 `pending_expenses.amount_minor` 统一为原币的百分之一，包括 JPY、KRW。归档的 `amount_units` 对该字段标明 `unit: "currency_hundredth"`、固定 `exponent: 2`，币种取自同一行的 `currency`。归档原始整数和 CLI 返回的原币金额不同：例如存储值 `100000` 对应 `1000 JPY`。所有整数也编码为字符串，以保持大整数精度。JSON 导出暂不提供导入命令，恢复使用 SQLite 备份。
 
 打开 v0.1.0 账本会自动应用新增迁移，不修改旧迁移文件或清空已有数据；建议升级前先备份。旧 SQLite 备份只要迁移记录是当前程序的已知完整前缀且校验正确即可恢复，首次打开恢复后的账本时自动升级。新版本已迁移的账本不支持用旧二进制打开；回退请使用升级前备份，不要手工删迁移记录。
 

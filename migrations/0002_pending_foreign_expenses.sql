@@ -6,7 +6,12 @@ ALTER TABLE transactions ADD COLUMN occurred_at TEXT
 CREATE TABLE pending_expenses (
     id TEXT PRIMARY KEY NOT NULL,
     currency TEXT NOT NULL CHECK(currency IN ('USD', 'JPY', 'EUR', 'GBP', 'HKD', 'SGD', 'AUD', 'CAD', 'CHF', 'NZD', 'KRW', 'TWD')),
-    amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+    -- Every currency is stored in hundredths. JPY/KRW independently require
+    -- whole currency units, so their stored amounts must end in 00.
+    amount_minor INTEGER NOT NULL CHECK(
+        amount_minor > 0
+        AND (currency NOT IN ('JPY', 'KRW') OR amount_minor % 100 = 0)
+    ),
     date TEXT NOT NULL CHECK(length(date) = 10),
     occurred_at TEXT CHECK(occurred_at IS NULL OR (length(occurred_at) >= 17 AND substr(occurred_at, 1, 10) = date)),
     category TEXT NOT NULL REFERENCES categories(name),

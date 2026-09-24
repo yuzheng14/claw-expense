@@ -51,6 +51,7 @@ impl Ledger {
 
 fn spawn_at(db: &Path, args: &[&str]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("--db")
         .arg(db)
         .arg("--json")
@@ -849,6 +850,7 @@ fn human_pending_list_identifies_original_currency_without_fake_zero_cny() {
     let ledger = Ledger::new();
     ledger.add("JPY", "10000", "2026-09-24");
     let output = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("--db")
         .arg(&ledger.db)
         .args(["pending", "list", "--as-of", "2026-09-28"])

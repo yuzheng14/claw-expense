@@ -34,6 +34,7 @@ impl Ledger {
 
 fn run_at(db: &Path, args: &[&str], input: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("--db")
         .arg(db)
         .arg("--json")
@@ -493,6 +494,7 @@ fn human_lists_and_details_display_recorded_offset_and_precision() {
         &["pending", "show", pending_id(&pending)][..],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+            .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
             .arg("--db")
             .arg(&ledger.db)
             .args(args)

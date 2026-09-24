@@ -2,7 +2,10 @@ use std::{fs, path::Path, process::Command};
 
 use claw_expense::{
     archive,
-    models::{ConfirmPendingExpense, Kind, NewPendingExpense, NewTransaction, WriteResult},
+    models::{
+        ConfirmPendingExpense, Kind, NewPendingExpense, NewTransaction, UpdateTransaction,
+        WriteResult,
+    },
     store::Store,
 };
 use serde_json::{Value, json};
@@ -11,10 +14,21 @@ use sqlx::{Row, SqlitePool, migrate::Migrator, sqlite::SqliteConnectOptions};
 /// Build the same schema and real SQLx checksums used by the published 0.1.0
 /// release, not a current database with its migration rows merely deleted.
 async fn legacy_store(path: &Path) -> Store {
-    store_at_version(path, 1).await
-}
-
-async fn store_at_version(path: &Path, version: i64) -> Store {
+    let migration = sqlx::migrate!()
+        .iter()
+        .find(|migration| migration.version == 1)
+        .unwrap()
+        .clone();
+    let checksum = migration
+        .checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        checksum,
+        "4ae224454d89397fdaa4df34a26e1603462c6ed2f013b8eccab843e890102dab9a25b5559df753f757c24722b4db31fb",
+        "published v0.1.0 migration must not be edited"
+    );
     let pool = SqlitePool::connect_with(
         SqliteConnectOptions::new()
             .filename(path)
@@ -23,12 +37,7 @@ async fn store_at_version(path: &Path, version: i64) -> Store {
     )
     .await
     .unwrap();
-    let migrations = sqlx::migrate!()
-        .iter()
-        .filter(|migration| migration.version <= version)
-        .cloned()
-        .collect();
-    Migrator::with_migrations(migrations)
+    Migrator::with_migrations(vec![migration])
         .run(&pool)
         .await
         .unwrap();
@@ -48,18 +57,8 @@ async fn legacy_request(store: &Store, id: &str, payload: Value, response: Value
         .execute(&store.pool).await.unwrap();
 }
 
-async fn legacy_audit(
-    store: &Store,
-    pending: bool,
-    action: &str,
-    before: Option<&Value>,
-    after: &Value,
-) {
-    let sql = if pending {
-        "INSERT INTO pending_audit_log (pending_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?)"
-    } else {
-        "INSERT INTO audit_log (transaction_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?)"
-    };
+async fn legacy_audit(store: &Store, action: &str, before: Option<&Value>, after: &Value) {
+    let sql = "INSERT INTO audit_log (transaction_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?)";
     sqlx::query(sql)
         .bind(after["id"].as_str().unwrap())
         .bind(action)
@@ -71,18 +70,23 @@ async fn legacy_audit(
         .unwrap();
 }
 
-async fn legacy_history(store: &Store, id: &str, pending: bool) -> Value {
-    let (sql, key) = if pending {
-        (
-            "SELECT * FROM pending_audit_log WHERE pending_id = ? ORDER BY id",
-            "pending_id",
-        )
-    } else {
-        (
-            "SELECT * FROM audit_log WHERE transaction_id = ? ORDER BY id",
-            "transaction_id",
-        )
-    };
+async fn legacy_snapshot(store: &Store) -> Value {
+    // Keep historical JSON as raw strings: deserializing and rebuilding it could
+    // hide an unintended audit or idempotency rewrite during the upgrade.
+    let transactions: Vec<String> = sqlx::query_scalar(
+        "SELECT json_object('id', id, 'kind', kind, 'amount_minor', amount_minor, 'currency', currency, 'category', category, 'date', date, 'note', note, 'channel', channel, 'original_id', original_id, 'voided', voided, 'created_at', created_at, 'updated_at', updated_at) FROM transactions ORDER BY id",
+    ).fetch_all(&store.pool).await.unwrap();
+    let audit: Vec<(i64, String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT id, transaction_id, action, before_json, after_json, created_at FROM audit_log ORDER BY id",
+    ).fetch_all(&store.pool).await.unwrap();
+    let requests: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT request_id, payload, response_json, created_at FROM idempotency ORDER BY request_id",
+    ).fetch_all(&store.pool).await.unwrap();
+    json!({ "transactions": transactions, "audit": audit, "idempotency": requests })
+}
+
+async fn legacy_history(store: &Store, id: &str) -> Value {
+    let sql = "SELECT * FROM audit_log WHERE transaction_id = ? ORDER BY id";
     Value::Array(sqlx::query(sql).bind(id).fetch_all(&store.pool).await.unwrap().iter().map(|row| {
         let mut item = json!({
             "id": row.get::<i64, _>("id"), "action": row.get::<String, _>("action"),
@@ -90,7 +94,7 @@ async fn legacy_history(store: &Store, id: &str, pending: bool) -> Value {
             "after": serde_json::from_str::<Value>(&row.get::<String, _>("after_json")).unwrap(),
             "created_at": row.get::<String, _>("created_at")
         });
-        item[key] = json!(id);
+        item["transaction_id"] = json!(id);
         item
     }).collect())
 }
@@ -120,7 +124,7 @@ async fn seed_legacy_transaction(
         .bind(if input.kind == Kind::Refund { None } else { Some(category) })
         .bind(&input.date).bind(&input.note).bind(&input.channel).bind(&input.original_id)
         .bind(LEGACY_TIMESTAMP).bind(LEGACY_TIMESTAMP).execute(&store.pool).await.unwrap();
-    legacy_audit(store, false, "create", None, &record).await;
+    legacy_audit(store, "create", None, &record).await;
     let response = json!({"transaction": record, "replayed": false, "affected_ids": [id]});
     if let Some(request) = request {
         legacy_request(
@@ -132,176 +136,6 @@ async fn seed_legacy_transaction(
         .await;
     }
     serde_json::from_value(response).unwrap()
-}
-
-async fn seed_legacy_pending(
-    store: &Store,
-    input: NewPendingExpense,
-    id: &str,
-    request: &str,
-) -> Value {
-    let record = json!({"id": id, "currency": input.currency, "amount": input.amount, "date": input.date,
-        "category": input.category.as_deref().unwrap_or("其他支出"), "merchant": input.merchant,
-        "note": input.note, "channel": input.channel, "status": "pending", "remind_on": "2026-10-01",
-        "transaction_id": null, "confirmed_at": null, "posted_date": null,
-        "created_at": LEGACY_TIMESTAMP, "updated_at": LEGACY_TIMESTAMP});
-    let minor = claw_expense::foreign::parse_foreign_minor(&input.currency, &input.amount).unwrap();
-    sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, category, merchant, note, channel, remind_on, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(id).bind(&input.currency).bind(minor).bind(&input.date)
-        .bind(input.category.as_deref().unwrap_or("其他支出")).bind(&input.merchant).bind(&input.note).bind(&input.channel)
-        .bind("2026-10-01").bind(LEGACY_TIMESTAMP).bind(LEGACY_TIMESTAMP).execute(&store.pool).await.unwrap();
-    legacy_audit(store, true, "create", None, &record).await;
-    let old_input = json!({"currency": input.currency, "amount": input.amount, "date": input.date,
-        "category": input.category, "merchant": input.merchant, "note": input.note, "channel": input.channel});
-    legacy_request(
-        store,
-        request,
-        json!({"operation": "pending.add", "input": old_input}),
-        json!({"pending": record, "transaction": null, "replayed": false}),
-    )
-    .await;
-    record
-}
-
-struct LegacyForeign {
-    jpy_id: String,
-    usd_id: String,
-    eur_id: String,
-    cny_id: String,
-    refund: WriteResult,
-    refund_input: NewTransaction,
-    confirmation: ConfirmPendingExpense,
-}
-
-async fn seed_legacy_foreign(store: &Store, prefix: &str) -> LegacyForeign {
-    let jpy_id = format!("pending_{prefix}_jpy");
-    let usd_id = format!("pending_{prefix}_usd");
-    let eur_id = format!("pending_{prefix}_eur");
-    let cny_id = format!("txn_{prefix}_cny");
-    let jpy = seed_legacy_pending(
-        store,
-        pending_expense("JPY", "10000"),
-        &jpy_id,
-        &format!("{prefix}-jpy-create"),
-    )
-    .await;
-    let mut snoozed = jpy.clone();
-    snoozed["remind_on"] = json!("2026-10-06");
-    sqlx::query("UPDATE pending_expenses SET remind_on = '2026-10-06' WHERE id = ?")
-        .bind(&jpy_id)
-        .execute(&store.pool)
-        .await
-        .unwrap();
-    legacy_audit(store, true, "snooze", Some(&jpy), &snoozed).await;
-    legacy_request(
-        store,
-        &format!("{prefix}-jpy-snooze"),
-        json!({"operation":"pending.snooze","id":jpy_id,"until":"2026-10-06"}),
-        json!({"pending":snoozed,"transaction":null,"replayed":false}),
-    )
-    .await;
-
-    let usd = seed_legacy_pending(
-        store,
-        pending_expense("USD", "20.00"),
-        &usd_id,
-        &format!("{prefix}-usd-create"),
-    )
-    .await;
-    let mut cny_input = legacy_expense();
-    cny_input.amount = "143.29".parse().unwrap();
-    cny_input.date = "2026-09-28".into();
-    cny_input.note = Some("原币金额等待银行换算".into());
-    let confirmed = seed_legacy_transaction(store, cny_input, &cny_id, None).await;
-    let mut cny_record = serde_json::to_value(&confirmed.transaction).unwrap();
-    cny_record.as_object_mut().unwrap().remove("occurred_at");
-    let confirmation = ConfirmPendingExpense {
-        amount: "143.29".parse().unwrap(),
-        posted_date: Some("2026-10-03".into()),
-    };
-    let mut confirmed_pending = usd.clone();
-    confirmed_pending["status"] = json!("confirmed");
-    confirmed_pending["transaction_id"] = json!(cny_id);
-    confirmed_pending["confirmed_at"] = json!(LEGACY_TIMESTAMP);
-    confirmed_pending["posted_date"] = json!("2026-10-03");
-    sqlx::query("UPDATE pending_expenses SET status = 'confirmed', transaction_id = ?, confirmed_amount_minor = 14329, confirmed_at = ?, posted_date = '2026-10-03' WHERE id = ?")
-        .bind(&cny_id).bind(LEGACY_TIMESTAMP).bind(&usd_id).execute(&store.pool).await.unwrap();
-    legacy_audit(store, true, "confirm", Some(&usd), &confirmed_pending).await;
-    legacy_request(
-        store,
-        &format!("{prefix}-usd-confirm"),
-        json!({"operation":"pending.confirm","id":usd_id,"input":confirmation}),
-        json!({"pending":confirmed_pending,"transaction":cny_record,"replayed":false}),
-    )
-    .await;
-    let mut edited = cny_record.clone();
-    edited["amount"] = json!("135.79");
-    sqlx::query("UPDATE transactions SET amount_minor = 13579 WHERE id = ?")
-        .bind(&cny_id)
-        .execute(&store.pool)
-        .await
-        .unwrap();
-    legacy_audit(store, false, "update", Some(&cny_record), &edited).await;
-    legacy_request(store, &format!("{prefix}-cny-edit"), json!({"operation":"update","id":cny_id,"patch":{"amount":"135.79","date":null,"category":null,"note":null,"channel":null}}),
-        json!({"transaction":edited,"replayed":false,"affected_ids":[cny_id]})).await;
-    let refund_input = NewTransaction {
-        kind: Kind::Refund,
-        amount: "150.00".parse().unwrap(),
-        date: "2026-10-04".into(),
-        occurred_at: None,
-        category: None,
-        note: Some("超额返还".into()),
-        channel: Some("信用卡".into()),
-        original_id: Some(cny_id.clone()),
-    };
-    let refund = seed_legacy_transaction(
-        store,
-        refund_input.clone(),
-        &format!("txn_{prefix}_refund"),
-        Some(&format!("{prefix}-refund")),
-    )
-    .await;
-
-    let eur = seed_legacy_pending(
-        store,
-        pending_expense("EUR", "1.29"),
-        &eur_id,
-        &format!("{prefix}-eur-create"),
-    )
-    .await;
-    let mut cancelled = eur.clone();
-    cancelled["status"] = json!("cancelled");
-    sqlx::query("UPDATE pending_expenses SET status = 'cancelled' WHERE id = ?")
-        .bind(&eur_id)
-        .execute(&store.pool)
-        .await
-        .unwrap();
-    legacy_audit(store, true, "cancel", Some(&eur), &cancelled).await;
-    legacy_request(
-        store,
-        &format!("{prefix}-eur-cancel"),
-        json!({"operation":"pending.cancel","id":eur_id,"until":null}),
-        json!({"pending":cancelled,"transaction":null,"replayed":false}),
-    )
-    .await;
-    LegacyForeign {
-        jpy_id,
-        usd_id,
-        eur_id,
-        cny_id,
-        refund,
-        refund_input,
-        confirmation,
-    }
-}
-
-fn strip_null_occurrences(tables: &mut Value) {
-    for name in ["transactions", "pending_expenses"] {
-        for record in tables[name].as_array_mut().unwrap() {
-            assert_eq!(record.get("occurred_at"), Some(&Value::Null));
-            record.as_object_mut().unwrap().remove("occurred_at");
-        }
-    }
 }
 
 fn legacy_expense() -> NewTransaction {
@@ -324,7 +158,82 @@ async fn opening_v0_1_0_upgrades_without_losing_cny_audit_or_idempotency() {
     let old = legacy_store(&path).await;
     let expense =
         seed_legacy_transaction(&old, legacy_expense(), "txn_legacy", Some("legacy-create")).await;
-    let history = legacy_history(&old, &expense.transaction.id, false).await;
+    let mut refundable_input = legacy_expense();
+    refundable_input.amount = "143.29".parse().unwrap();
+    let refundable = seed_legacy_transaction(
+        &old,
+        refundable_input.clone(),
+        "txn_refundable",
+        Some("refundable-create"),
+    )
+    .await;
+    let mut before_edit = serde_json::to_value(&refundable.transaction).unwrap();
+    before_edit.as_object_mut().unwrap().remove("occurred_at");
+    let mut after_edit = before_edit.clone();
+    after_edit["amount"] = json!("135.79");
+    sqlx::query("UPDATE transactions SET amount_minor = 13579 WHERE id = 'txn_refundable'")
+        .execute(&old.pool)
+        .await
+        .unwrap();
+    legacy_audit(&old, "update", Some(&before_edit), &after_edit).await;
+    legacy_request(
+        &old,
+        "refundable-edit",
+        json!({
+            "operation": "update", "id": "txn_refundable",
+            "patch": {"amount":"135.79", "date":null, "category":null, "note":null, "channel":null}
+        }),
+        json!({"transaction":after_edit, "replayed":false, "affected_ids":["txn_refundable"]}),
+    )
+    .await;
+    let refund_input = NewTransaction {
+        kind: Kind::Refund,
+        amount: "150.00".parse().unwrap(),
+        date: "2026-10-04".into(),
+        occurred_at: None,
+        category: None,
+        note: Some("超额返还".into()),
+        channel: Some("信用卡".into()),
+        original_id: Some(refundable.transaction.id.clone()),
+    };
+    let refund = seed_legacy_transaction(
+        &old,
+        refund_input.clone(),
+        "txn_refund",
+        Some("refund-create"),
+    )
+    .await;
+    let mut income_input = legacy_expense();
+    income_input.kind = Kind::Income;
+    income_input.category = Some("工资".into());
+    income_input.amount = "42.10".parse().unwrap();
+    let income = seed_legacy_transaction(
+        &old,
+        income_input.clone(),
+        "txn_income",
+        Some("income-create"),
+    )
+    .await;
+    let history = legacy_history(&old, &refundable.transaction.id).await;
+    let snapshot = legacy_snapshot(&old).await;
+    assert!(!snapshot.to_string().contains("occurred_at"));
+    for query in [
+        "SELECT COUNT(*) FROM pragma_table_info('transactions') WHERE name = 'occurred_at'",
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('pending_expenses', 'pending_audit_log')",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(query)
+                .fetch_one(&old.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    let original_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(&old.pool)
+            .await
+            .unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&old.pool)
@@ -335,6 +244,13 @@ async fn opening_v0_1_0_upgrades_without_losing_cny_audit_or_idempotency() {
     old.pool.close().await;
 
     let upgraded = Store::open(&path, false).await.unwrap();
+    let retained_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(&upgraded.pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_checksum, original_checksum);
+    assert_eq!(legacy_snapshot(&upgraded).await, snapshot);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&upgraded.pool)
@@ -345,10 +261,33 @@ async fn opening_v0_1_0_upgrades_without_losing_cny_audit_or_idempotency() {
     let detail = upgraded.get(&expense.transaction.id).await.unwrap();
     assert_eq!(detail.transaction.amount.minor(), i64::MAX);
     assert_eq!(detail.transaction.category, "购物");
+    assert!(detail.transaction.occurred_at.is_none());
     assert!(detail.foreign_expense.is_none());
     assert_eq!(
-        serde_json::to_value(upgraded.history(&expense.transaction.id).await.unwrap()).unwrap(),
+        serde_json::to_value(upgraded.history(&refundable.transaction.id).await.unwrap()).unwrap(),
         history
+    );
+    let refunded = upgraded.get(&refundable.transaction.id).await.unwrap();
+    assert_eq!(refunded.transaction.amount.to_string(), "135.79");
+    assert_eq!(refunded.refund_total, "150.00");
+    assert_eq!(refunded.net_expense.as_deref(), Some("-14.21"));
+    assert_eq!(
+        upgraded
+            .get(&refund.transaction.id)
+            .await
+            .unwrap()
+            .transaction
+            .category,
+        "购物"
+    );
+    assert_eq!(
+        upgraded
+            .get(&income.transaction.id)
+            .await
+            .unwrap()
+            .transaction
+            .kind,
+        Kind::Income
     );
     let replay = upgraded
         .add(legacy_expense(), Some("legacy-create"))
@@ -356,12 +295,50 @@ async fn opening_v0_1_0_upgrades_without_losing_cny_audit_or_idempotency() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.transaction.id, expense.transaction.id);
+    assert!(replay.transaction.occurred_at.is_none());
+    for (input, request, id) in [
+        (
+            refundable_input,
+            "refundable-create",
+            &refundable.transaction.id,
+        ),
+        (refund_input, "refund-create", &refund.transaction.id),
+        (income_input, "income-create", &income.transaction.id),
+    ] {
+        let replay = upgraded.add(input, Some(request)).await.unwrap();
+        assert!(replay.replayed);
+        assert_eq!(&replay.transaction.id, id);
+        assert!(replay.transaction.occurred_at.is_none());
+    }
+    let edited = upgraded
+        .update(
+            &refundable.transaction.id,
+            UpdateTransaction {
+                amount: Some("135.79".parse().unwrap()),
+                ..Default::default()
+            },
+            Some("refundable-edit"),
+        )
+        .await
+        .unwrap();
+    assert!(edited.replayed);
+    assert!(edited.transaction.occurred_at.is_none());
+    assert_eq!(legacy_snapshot(&upgraded).await, snapshot);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM transactions")
             .fetch_one(&upgraded.pool)
             .await
             .unwrap(),
-        1
+        4
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM transactions WHERE occurred_at IS NOT NULL"
+        )
+        .fetch_one(&upgraded.pool)
+        .await
+        .unwrap(),
+        0
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_expenses")
@@ -374,18 +351,145 @@ async fn opening_v0_1_0_upgrades_without_losing_cny_audit_or_idempotency() {
 }
 
 #[tokio::test]
+async fn upgraded_v0_1_0_supports_twd_and_times_with_indexes_triggers_and_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("upgraded.sqlite");
+    legacy_store(&path).await.pool.close().await;
+    let upgraded = Store::open(&path, false).await.unwrap();
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&upgraded.pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, [1, 2]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&upgraded.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    let objects: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, type FROM sqlite_schema WHERE type IN ('index', 'trigger') AND name LIKE 'pending_%' ORDER BY name",
+    ).fetch_all(&upgraded.pool).await.unwrap();
+    assert_eq!(
+        objects,
+        [
+            ("pending_audit_log_pending", "index"),
+            ("pending_category_insert", "trigger"),
+            ("pending_category_update", "trigger"),
+            ("pending_closed_immutable", "trigger"),
+            ("pending_expenses_date", "index"),
+            ("pending_expenses_due", "index"),
+            ("pending_linked_transaction_kind", "trigger"),
+            ("pending_transaction_insert", "trigger"),
+            ("pending_transaction_update", "trigger"),
+        ]
+        .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT \"table\" FROM pragma_foreign_key_list('pending_audit_log')",
+        )
+        .fetch_all(&upgraded.pool)
+        .await
+        .unwrap(),
+        ["pending_expenses"]
+    );
+    let mut cny_input = legacy_expense();
+    cny_input.amount = "98.01".parse().unwrap();
+    cny_input.occurred_at = Some("2026-09-22T12:35+08:00".into());
+    let cny = upgraded.add(cny_input, Some("timed-cny")).await.unwrap();
+    assert_eq!(
+        cny.transaction.occurred_at.as_deref(),
+        Some("2026-09-22T12:35+08:00")
+    );
+    assert!(
+        sqlx::query("UPDATE transactions SET date = '2026-09-23' WHERE id = ?")
+            .bind(&cny.transaction.id)
+            .execute(&upgraded.pool)
+            .await
+            .is_err()
+    );
+
+    let mut input = pending_expense("TWD", "123.45");
+    input.occurred_at = Some("2026-09-28T23:30:05+08:00".into());
+    let pending = upgraded
+        .add_pending(input, Some("timed-twd"))
+        .await
+        .unwrap();
+    for query in [
+        "UPDATE pending_expenses SET currency = 'INVALID' WHERE id = ?",
+        "UPDATE pending_expenses SET category = '工资' WHERE id = ?",
+        "UPDATE pending_expenses SET occurred_at = '2026-09-29T23:30+08:00' WHERE id = ?",
+        "UPDATE pending_expenses SET status = 'confirmed', transaction_id = 'missing', confirmed_amount_minor = 2712, confirmed_at = '2026-10-04T12:00:00Z' WHERE id = ?",
+    ] {
+        assert!(
+            sqlx::query(query)
+                .bind(&pending.pending.id)
+                .execute(&upgraded.pool)
+                .await
+                .is_err(),
+            "{query}"
+        );
+    }
+    assert!(sqlx::query("INSERT INTO pending_audit_log (pending_id, action, after_json, created_at) VALUES ('missing', 'create', '{}', '2026-10-04T12:00:00Z')")
+        .execute(&upgraded.pool).await.is_err());
+    let confirmed = upgraded
+        .confirm_pending(
+            &pending.pending.id,
+            ConfirmPendingExpense {
+                amount: "27.12".parse().unwrap(),
+                posted_date: Some("2026-10-03".into()),
+            },
+            Some("twd-confirm"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirmed.pending.currency, "TWD");
+    assert_eq!(confirmed.pending.amount, "123.45");
+    let transaction = confirmed.transaction.unwrap();
+    assert_eq!(transaction.amount.to_string(), "27.12");
+    assert_eq!(transaction.occurred_at, confirmed.pending.occurred_at);
+    assert_eq!(transaction.date, "2026-09-28");
+    assert!(
+        sqlx::query("UPDATE pending_expenses SET note = 'forbidden' WHERE id = ?")
+            .bind(&pending.pending.id)
+            .execute(&upgraded.pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE transactions SET kind = 'income' WHERE id = ?")
+            .bind(&transaction.id)
+            .execute(&upgraded.pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&upgraded.pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    upgraded.pool.close().await;
+}
+
+#[tokio::test]
 async fn new_cli_restores_a_v0_1_0_backup_without_modifying_the_source() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("legacy-backup.sqlite");
     let old = legacy_store(&source).await;
     let expense =
         seed_legacy_transaction(&old, legacy_expense(), "txn_legacy", Some("legacy-create")).await;
-    let history = legacy_history(&old, &expense.transaction.id, false).await;
+    let history = legacy_history(&old, &expense.transaction.id).await;
     old.pool.close().await;
     let source_bytes = fs::read(&source).unwrap();
 
     let destination = directory.path().join("restored.sqlite");
     let output = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("--db")
         .arg(&destination)
         .args(["--json", "restore", "--input"])
@@ -608,313 +712,6 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
     );
     restored.pool.close().await;
     store.pool.close().await;
-}
-
-#[tokio::test]
-async fn v2_currency_expansion_preserves_all_records_and_accepts_twd_with_foreign_keys_enabled() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("v2.sqlite");
-    let old = store_at_version(&path, 2).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
-            .fetch_one(&old.pool)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&old.pool)
-            .await
-            .unwrap(),
-        2
-    );
-
-    let jpy_input = pending_expense("JPY", "10000");
-    let fixture = seed_legacy_foreign(&old, "v2").await;
-
-    // Prove this really is the old CHECK constraint, not a current schema
-    // disguised by removing its latest migration row.
-    assert!(
-        sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, category, remind_on, created_at, updated_at) SELECT 'unsupported-twd', 'TWD', 100, date, category, remind_on, created_at, updated_at FROM pending_expenses WHERE id = ?")
-            .bind(&fixture.jpy_id)
-            .execute(&old.pool)
-            .await
-            .is_err()
-    );
-    let old_schema: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT name, type, sql FROM sqlite_schema WHERE type IN ('index', 'trigger') AND name LIKE 'pending_%' ORDER BY name",
-    )
-    .fetch_all(&old.pool)
-    .await
-    .unwrap();
-    assert_eq!(old_schema.len(), 9);
-    let before_path = directory.path().join("before.json");
-    archive::export(&old, &before_path).await.unwrap();
-    let before: Value = serde_json::from_slice(&fs::read(&before_path).unwrap()).unwrap();
-    let old_pending_history = legacy_history(&old, &fixture.usd_id, true).await;
-    old.pool.close().await;
-
-    let upgraded = Store::open(&path, false).await.unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
-            .fetch_one(&upgraded.pool)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&upgraded.pool)
-            .await
-            .unwrap(),
-        sqlx::migrate!().iter().count() as i64
-    );
-    assert!(
-        sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&upgraded.pool)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let new_schema: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT name, type, sql FROM sqlite_schema WHERE type IN ('index', 'trigger') AND name LIKE 'pending_%' ORDER BY name",
-    )
-    .fetch_all(&upgraded.pool)
-    .await
-    .unwrap();
-    assert_eq!(new_schema, old_schema);
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT \"table\" FROM pragma_foreign_key_list('pending_audit_log')",
-        )
-        .fetch_all(&upgraded.pool)
-        .await
-        .unwrap(),
-        ["pending_expenses"]
-    );
-    let after_path = directory.path().join("after.json");
-    archive::export(&upgraded, &after_path).await.unwrap();
-    let mut after: Value = serde_json::from_slice(&fs::read(&after_path).unwrap()).unwrap();
-    strip_null_occurrences(&mut after["tables"]);
-    assert_eq!(after["tables"], before["tables"]);
-    let current = upgraded.get(&fixture.cny_id).await.unwrap();
-    assert_eq!(current.transaction.amount.to_string(), "135.79");
-    assert_eq!(current.refund_total, "150.00");
-    assert_eq!(current.net_expense.as_deref(), Some("-14.21"));
-    assert_eq!(current.foreign_expense.unwrap().id, fixture.usd_id);
-    assert_eq!(
-        serde_json::to_value(upgraded.pending_history(&fixture.usd_id).await.unwrap()).unwrap(),
-        old_pending_history
-    );
-
-    assert!(
-        upgraded
-            .add_pending(jpy_input, Some("v2-jpy-create"))
-            .await
-            .unwrap()
-            .replayed
-    );
-    assert!(
-        upgraded
-            .snooze_pending(&fixture.jpy_id, "2026-10-06", Some("v2-jpy-snooze"))
-            .await
-            .unwrap()
-            .replayed
-    );
-    let repeated_confirmation = upgraded
-        .confirm_pending(
-            &fixture.usd_id,
-            fixture.confirmation,
-            Some("v2-usd-confirm"),
-        )
-        .await
-        .unwrap();
-    assert!(repeated_confirmation.replayed);
-    assert_eq!(
-        repeated_confirmation
-            .transaction
-            .unwrap()
-            .amount
-            .to_string(),
-        "143.29"
-    );
-    let repeated_refund = upgraded
-        .add(fixture.refund_input, Some("v2-refund"))
-        .await
-        .unwrap();
-    assert!(repeated_refund.replayed);
-    assert_eq!(
-        repeated_refund.transaction.id,
-        fixture.refund.transaction.id
-    );
-    assert!(
-        upgraded
-            .cancel_pending(&fixture.eur_id, Some("v2-eur-cancel"))
-            .await
-            .unwrap()
-            .replayed
-    );
-    // The reinstalled closed-state trigger must still protect old snapshots.
-    assert!(
-        sqlx::query("UPDATE pending_expenses SET note = 'forbidden' WHERE id = ?")
-            .bind(&fixture.usd_id)
-            .execute(&upgraded.pool)
-            .await
-            .is_err()
-    );
-
-    let twd = upgraded
-        .add_pending(pending_expense("TWD", "123.45"), Some("twd-create"))
-        .await
-        .unwrap();
-    assert_eq!(twd.pending.currency, "TWD");
-    assert_eq!(twd.pending.amount, "123.45");
-    let twd_confirmed = upgraded
-        .confirm_pending(
-            &twd.pending.id,
-            ConfirmPendingExpense {
-                amount: "27.12".parse().unwrap(),
-                posted_date: None,
-            },
-            Some("twd-confirm"),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        twd_confirmed.transaction.unwrap().amount.to_string(),
-        "27.12"
-    );
-    assert!(
-        sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&upgraded.pool)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    upgraded.pool.close().await;
-}
-
-#[tokio::test]
-async fn v3_date_only_upgrade_preserves_history_and_replays_without_inventing_occurrence_times() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("date-only-v3.sqlite");
-    let old = store_at_version(&path, 3).await;
-    let expense =
-        seed_legacy_transaction(&old, legacy_expense(), "txn_legacy_v3", Some("v3-create")).await;
-    let fixture = seed_legacy_foreign(&old, "v3").await;
-    for query in [
-        "SELECT COUNT(*) FROM pragma_table_info('transactions') WHERE name = 'occurred_at'",
-        "SELECT COUNT(*) FROM pragma_table_info('pending_expenses') WHERE name = 'occurred_at'",
-    ] {
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(query)
-                .fetch_one(&old.pool)
-                .await
-                .unwrap(),
-            0
-        );
-    }
-    let checksums: Vec<(i64, Vec<u8>)> =
-        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&old.pool)
-            .await
-            .unwrap();
-    assert_eq!(checksums.len(), 3);
-    let before_path = directory.path().join("v3-before.json");
-    archive::export(&old, &before_path).await.unwrap();
-    let before: Value = serde_json::from_slice(&fs::read(&before_path).unwrap()).unwrap();
-    assert!(!before["tables"].to_string().contains("occurred_at"));
-    let cny_history = legacy_history(&old, &fixture.cny_id, false).await;
-    let pending_history = legacy_history(&old, &fixture.usd_id, true).await;
-    old.pool.close().await;
-
-    let upgraded = Store::open(&path, false).await.unwrap();
-    let retained_checksums: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 3 ORDER BY version",
-    )
-    .fetch_all(&upgraded.pool)
-    .await
-    .unwrap();
-    assert_eq!(retained_checksums, checksums);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&upgraded.pool)
-            .await
-            .unwrap(),
-        4
-    );
-    let after_path = directory.path().join("v3-after.json");
-    archive::export(&upgraded, &after_path).await.unwrap();
-    let mut after: Value = serde_json::from_slice(&fs::read(&after_path).unwrap()).unwrap();
-    strip_null_occurrences(&mut after["tables"]);
-    assert_eq!(after["tables"], before["tables"]);
-    assert_eq!(
-        serde_json::to_value(upgraded.history(&fixture.cny_id).await.unwrap()).unwrap(),
-        cny_history
-    );
-    assert_eq!(
-        serde_json::to_value(upgraded.pending_history(&fixture.usd_id).await.unwrap()).unwrap(),
-        pending_history
-    );
-
-    let repeated_cny = upgraded
-        .add(legacy_expense(), Some("v3-create"))
-        .await
-        .unwrap();
-    assert!(repeated_cny.replayed);
-    assert_eq!(repeated_cny.transaction.id, expense.transaction.id);
-    assert!(repeated_cny.transaction.occurred_at.is_none());
-    let repeated_pending = upgraded
-        .add_pending(pending_expense("JPY", "10000"), Some("v3-jpy-create"))
-        .await
-        .unwrap();
-    assert!(repeated_pending.replayed);
-    assert!(repeated_pending.pending.occurred_at.is_none());
-    let repeated_confirm = upgraded
-        .confirm_pending(
-            &fixture.usd_id,
-            fixture.confirmation,
-            Some("v3-usd-confirm"),
-        )
-        .await
-        .unwrap();
-    assert!(repeated_confirm.replayed);
-    assert!(repeated_confirm.pending.occurred_at.is_none());
-    assert!(repeated_confirm.transaction.unwrap().occurred_at.is_none());
-    let repeated_edit = upgraded
-        .update(
-            &fixture.cny_id,
-            claw_expense::models::UpdateTransaction {
-                amount: Some("135.79".parse().unwrap()),
-                ..Default::default()
-            },
-            Some("v3-cny-edit"),
-        )
-        .await
-        .unwrap();
-    assert!(repeated_edit.replayed);
-    assert!(repeated_edit.transaction.occurred_at.is_none());
-    let cancelled = upgraded.get_pending(&fixture.eur_id).await.unwrap();
-    assert_eq!(cancelled.pending.status, "cancelled");
-    assert!(cancelled.pending.occurred_at.is_none());
-    assert_eq!(
-        upgraded
-            .get_pending(&fixture.jpy_id)
-            .await
-            .unwrap()
-            .pending
-            .remind_on,
-        "2026-10-06"
-    );
-    assert!(
-        sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&upgraded.pool)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    upgraded.pool.close().await;
 }
 
 #[tokio::test]

@@ -1,8 +1,14 @@
+-- Unknown historical occurrence times remain NULL. Existing audit and
+-- idempotency snapshots are intentionally left unchanged.
+ALTER TABLE transactions ADD COLUMN occurred_at TEXT
+    CHECK(occurred_at IS NULL OR (length(occurred_at) >= 17 AND substr(occurred_at, 1, 10) = date));
+
 CREATE TABLE pending_expenses (
     id TEXT PRIMARY KEY NOT NULL,
-    currency TEXT NOT NULL CHECK(currency IN ('USD', 'JPY', 'EUR', 'GBP', 'HKD', 'SGD', 'AUD', 'CAD', 'CHF', 'NZD', 'KRW')),
+    currency TEXT NOT NULL CHECK(currency IN ('USD', 'JPY', 'EUR', 'GBP', 'HKD', 'SGD', 'AUD', 'CAD', 'CHF', 'NZD', 'KRW', 'TWD')),
     amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
     date TEXT NOT NULL CHECK(length(date) = 10),
+    occurred_at TEXT CHECK(occurred_at IS NULL OR (length(occurred_at) >= 17 AND substr(occurred_at, 1, 10) = date)),
     category TEXT NOT NULL REFERENCES categories(name),
     merchant TEXT,
     note TEXT,

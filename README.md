@@ -30,6 +30,30 @@ bash skills/claw-expense/scripts/run.sh --db ./ledger.sqlite init
 
 直接使用 CLI 的用户，也可以从同一 Release 下载 `claw-expense-v0.1.0-aarch64-apple-darwin.tar.gz`，用 `SHA256SUMS` 校验并解压后运行其中的 `claw-expense`。
 
+### 更新可用提醒
+
+CLI 在业务命令成功、输出结果后，默认最多每 24 小时向本项目的 GitHub Release API 检查一次最新正式版。发现版本高于当前 CLI 时，在 **stderr** 输出一行：
+
+```text
+[WARN] 有更新可用：claw-expense 0.1.0 → 0.2.0；请手动更新：https://github.com/yuzheng14/claw-expense/releases/tag/v0.2.0（不会自动升级）
+```
+
+上面是示例，不表示该版本已发布。缓存有效期间不重复联网，但每次成功命令仍会提示缓存中已知的新版，直到升级或关闭提醒。按 SemVer 比较版本，不提示草稿、预发布版、相同版本或降级；构建元数据不影响版本高低。
+
+- **只提醒，不自动下载、替换程序或修改账本。** `--json` 的 stdout 和退出码不受提醒影响，stderr 有 `[WARN]` 不代表记账失败。
+- 使用系统 `curl`，仅请求公开 Release 元数据，不使用 GitHub 登录凭据、不发送账单内容、不读取 `.curlrc`。缺少 `curl`、网络错误、API 限流和异常响应均静默跳过。
+- 每次联网检查最多等待约 1.5 秒，失败也缓存检查时间；不会在每次记账时反复等待网络。`--help`、`--version`、参数错误和业务失败不触发检查。
+- 缓存保存到操作系统的 claw-expense 缓存目录（macOS 为 `~/Library/Caches/claw-expense`），不是 SQLite 账本。可用 `CLAW_EXPENSE_UPDATE_CACHE_DIR` 指定独立目录；缓存不可写时跳过联网检查。
+
+完全离线或不需要提醒时，使用以下任一方式；关闭后不读写检查缓存、不联网，也不显示已缓存的提醒：
+
+```bash
+claw-expense --no-update-check --json list
+CLAW_EXPENSE_NO_UPDATE_CHECK=1 claw-expense --json list
+# Skill 包装脚本也原样传递该选项
+bash skills/claw-expense/scripts/run.sh --no-update-check --json list
+```
+
 ## 构建与运行
 
 需要 Rust 1.94+ 和 C 编译器（编译内置 SQLite）。

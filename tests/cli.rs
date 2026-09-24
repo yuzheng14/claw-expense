@@ -64,6 +64,7 @@ impl Ledger {
 
 fn run_at(db: &Path, args: &[&str], input: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("--db")
         .arg(db)
         .arg("--json")
@@ -164,6 +165,7 @@ fn initialization_is_explicit_and_global_options_work_after_subcommands() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_claw-expense"))
+        .env("CLAW_EXPENSE_NO_UPDATE_CHECK", "1")
         .arg("init")
         .arg("--db")
         .arg(&ledger.db)

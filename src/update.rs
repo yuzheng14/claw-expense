@@ -21,6 +21,17 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 const MAX_CACHE: u64 = 4096;
 const CACHE_FILE: &str = "update-check.json";
 
+struct CacheLock(File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // Closing just this descriptor is insufficient if another thread forked
+        // while it was open: the child temporarily inherits the same lock, even
+        // with close-on-exec. Explicitly unlock before dropping our descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
     schema: u8,
@@ -79,6 +90,7 @@ async fn check(
     let lock = options.open(directory.join("update-check.lock")).ok()?;
     // No waiting for another CLI process. The OS releases the lock even on a crash.
     lock.try_lock().ok()?;
+    let _lock = CacheLock(lock);
     let mut cache = read_cache(directory).unwrap_or_default();
     if cache.schema != 1
         || !now
@@ -344,6 +356,33 @@ mod tests {
             .await
             .is_none()
         );
+    }
+
+    #[test]
+    fn releasing_cache_lock_does_not_wait_for_duplicated_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update-check.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        // Model the duplicated open-file description inherited across fork.
+        let duplicate = file.try_clone().unwrap();
+        let guard = CacheLock(file);
+        let next = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(next.try_lock().is_err());
+        drop(guard);
+        next.try_lock()
+            .expect("duplicate descriptor must not retain the old lock");
+        next.unlock().unwrap();
+        drop(duplicate);
     }
 
     #[cfg(unix)]

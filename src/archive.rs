@@ -232,6 +232,7 @@ mod tests {
             kind: Kind::Expense,
             amount: "98.01".parse().unwrap(),
             date: "2026-09-22".into(),
+            occurred_at: None,
             category: None,
             note: Some("WAL snapshot".into()),
             channel: None,

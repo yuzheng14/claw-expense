@@ -12,6 +12,7 @@
 
 - 支持 USD、EUR、GBP、HKD、SGD、AUD、CAD、CHF、NZD、TWD（最多两位小数），JPY、KRW（整数）；“新台币”或“台币”使用 `TWD`，例如 `{"currency":"TWD","amount":"1234.56","date":"2026-09-24"}`。未支持的币种应如实说明，不猜测精度或转换金额。
 - 记录处于 `pending` 状态，返回 `pending.id`。`pending.amount` 始终是原币金额；`transaction: null` 表示没有人民币支出，不是零元支出。
+- 知道消费时间时，JSON 可追加 `occurred_at`（如 `2026-09-30T14:35+08:00`）；遵循 SKILL.md 的时区和精度规则，`date` 仍必填且与时间当地日期一致。只知道日期时省略时间，不伪造凌晨零点。确认人民币金额会复制原消费时间，不改为确认时刻。
 - 默认 `remind_on` 为消费日后 3 个日历日。这只是 CLI 的查询条件，不表示已建立主动提醒。
 - 查询用 `pending list`，默认只列待确认，按消费日期由旧到新。支持月份、日期范围、币种、分类、搜索和分页；不要用第一页代表全部记录。
 - `pending show <ID>` 看详情；`pending list --status all` 也可看已确认和取消记录。
@@ -26,7 +27,7 @@ bash "{baseDir}/scripts/run.sh" --db "<账本绝对路径>" --json \
   --request-id <确认消息ID及操作序号>
 ```
 
-`--amount` 是实际人民币金额，不是汇率。不知道银行准确入账日期时省略 `--posted-date`；系统确认时间由 CLI 自动记录，不能将今天冒充银行入账日。
+`--amount` 是实际人民币金额，不是汇率。不知道银行准确入账日期时省略 `--posted-date`；系统确认时间由 CLI 自动记录，不能将今天冒充银行入账日，也不能把 `confirmed_at` 当作消费时间。
 
 确认是原消费的后续动作，不要另外执行 `add expense`。返回唯一关联的 `transaction.id`，消费仍归原消费日期；跨月确认会补齐原消费月报。相同确认重复执行不生成第二笔支出；`ALREADY_CONFIRMED` 表示金额或银行入账日期与首次确认冲突，先查询，不换 ID 新建。
 

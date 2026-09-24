@@ -10,6 +10,7 @@ use crate::{
     error::{AppError, Result},
     models::*,
     money::Money,
+    occurrence::validate_occurrence,
     store::{
         Store, audit, checked_add, clean_optional, fetch_record, now, require_category,
         save_request, validate_amount, validate_date, validate_filters, validate_request_id,
@@ -81,7 +82,7 @@ impl Store {
     ) -> Result<PendingWriteResult> {
         let minor = parse_foreign_minor(&input.currency, &input.amount)?;
         input.amount = format_foreign_minor(&input.currency, i128::from(minor))?;
-        validate_date(&input.date)?;
+        input.occurred_at = validate_occurrence(&input.date, input.occurred_at.as_deref())?;
         validate_request_id(request_id)?;
         let remind_on = NaiveDate::parse_from_str(&input.date, "%Y-%m-%d")
             .expect("validated date")
@@ -102,8 +103,8 @@ impl Store {
         require_category(&mut tx, category, Kind::Expense).await?;
         let id = format!("pending_{}", uuid::Uuid::new_v4().simple());
         let now = now();
-        sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, category, merchant, note, channel, remind_on, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(&input.currency).bind(minor).bind(&input.date).bind(category)
+        sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, occurred_at, category, merchant, note, channel, remind_on, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&id).bind(&input.currency).bind(minor).bind(&input.date).bind(&input.occurred_at).bind(category)
             .bind(clean_optional(input.merchant)).bind(clean_optional(input.note))
             .bind(clean_optional(input.channel)).bind(remind_on).bind(&now).bind(&now)
             .execute(&mut *tx).await?;
@@ -174,9 +175,9 @@ impl Store {
         require_category(&mut tx, &before.category, Kind::Expense).await?;
         let transaction_id = format!("txn_{}", uuid::Uuid::new_v4().simple());
         let now = now();
-        sqlx::query("INSERT INTO transactions (id, kind, amount_minor, category, date, note, channel, created_at, updated_at) VALUES (?, 'expense', ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO transactions (id, kind, amount_minor, category, date, occurred_at, note, channel, created_at, updated_at) VALUES (?, 'expense', ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&transaction_id).bind(input.amount.minor()).bind(&before.category).bind(&before.date)
-            .bind(&before.note).bind(&before.channel).bind(&now).bind(&now)
+            .bind(&before.occurred_at).bind(&before.note).bind(&before.channel).bind(&now).bind(&now)
             .execute(&mut *tx).await?;
         let transaction = fetch_record(&mut tx, &transaction_id).await?;
         audit(&mut tx, "create", None, &transaction).await?;
@@ -389,6 +390,7 @@ fn decode_pending(row: &SqliteRow) -> Result<PendingExpenseRecord> {
         currency,
         amount,
         date: row.try_get("date")?,
+        occurred_at: row.try_get("occurred_at")?,
         category: row.try_get("category")?,
         merchant: row.try_get("merchant")?,
         note: row.try_get("note")?,
@@ -570,6 +572,7 @@ mod tests {
             currency: currency.into(),
             amount: amount.into(),
             date: "2026-09-29".into(),
+            occurred_at: None,
             category: Some("购物".into()),
             merchant: Some("乐天".into()),
             note: Some("海淘".into()),
@@ -592,6 +595,129 @@ mod tests {
             as_of: as_of.into(),
             due_only: false,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_occurrence_survives_confirmation_without_moving_date_or_reminder() {
+        let (_dir, store) = ledger().await;
+        let mut data = input("USD", "20");
+        data.date = "2026-09-30".into();
+        data.occurred_at = Some("2026-09-30T23:30:12.123-07:00".into());
+        let pending = store
+            .add_pending(data.clone(), Some("timed-pending"))
+            .await
+            .unwrap()
+            .pending;
+        assert_eq!(pending.remind_on, "2026-10-03");
+        assert_eq!(pending.occurred_at, data.occurred_at);
+        assert_eq!(
+            store
+                .list_pending(&pending_filters("2026-10-03"))
+                .await
+                .unwrap()
+                .items[0]
+                .occurred_at,
+            data.occurred_at
+        );
+        let confirmed = store
+            .confirm_pending(&pending.id, confirm("140"), Some("confirm-time"))
+            .await
+            .unwrap();
+        let txn = confirmed.transaction.unwrap();
+        assert_eq!(txn.date, "2026-09-30");
+        assert_eq!(txn.occurred_at, data.occurred_at);
+        assert_eq!(
+            store
+                .get(&txn.id)
+                .await
+                .unwrap()
+                .foreign_expense
+                .unwrap()
+                .occurred_at,
+            data.occurred_at
+        );
+        assert_eq!(
+            store.pending_history(&pending.id).await.unwrap()[1].after["occurred_at"],
+            "2026-09-30T23:30:12.123-07:00"
+        );
+        assert_eq!(
+            store
+                .summary(&Filters {
+                    month: Some("2026-09".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .expense,
+            "140.00"
+        );
+        assert_eq!(
+            store
+                .summary(&Filters {
+                    month: Some("2026-10".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .expense,
+            "0.00"
+        );
+        data.date = "2026-10-01".into();
+        assert!(store.add_pending(data, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_old_payloads_and_snapshots_remain_compatible() {
+        let (_dir, store) = ledger().await;
+        let old = input("USD", "20");
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({
+                "currency": "USD", "amount": "20", "date": "2026-09-29", "category": "购物",
+                "merchant": "乐天", "note": "海淘", "channel": "信用卡"
+            })
+        );
+        let pending = store
+            .add_pending(old.clone(), Some("legacy-pending"))
+            .await
+            .unwrap()
+            .pending;
+        sqlx::query("UPDATE idempotency SET response_json = json_remove(response_json, '$.pending.occurred_at')")
+            .execute(&store.pool).await.unwrap();
+        let replay = store
+            .add_pending(old, Some("legacy-pending"))
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(replay.pending.occurred_at.is_none());
+        assert!(
+            store
+                .confirm_pending(&pending.id, confirm("140"), None)
+                .await
+                .unwrap()
+                .transaction
+                .unwrap()
+                .occurred_at
+                .is_none()
+        );
+        let mut utc = input("USD", "20");
+        utc.occurred_at = Some("2026-09-29T10:30+00:00".into());
+        let first = store
+            .add_pending(utc.clone(), Some("canonical-time"))
+            .await
+            .unwrap();
+        utc.occurred_at = Some("2026-09-29T10:30Z".into());
+        let replay = store
+            .add_pending(utc, Some("canonical-time"))
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.pending.id, first.pending.id);
+        assert_eq!(
+            replay.pending.occurred_at.as_deref(),
+            Some("2026-09-29T10:30Z")
+        );
+        assert!(sqlx::query("UPDATE pending_expenses SET occurred_at = '2026-10-01T12:00Z' WHERE status = 'pending'").execute(&store.pool).await.is_err());
     }
 
     #[test]
@@ -718,6 +844,7 @@ mod tests {
                     kind: Kind::Refund,
                     amount: "520.00".parse().unwrap(),
                     date: "2026-10-04".into(),
+                    occurred_at: None,
                     category: None,
                     note: None,
                     channel: None,
@@ -1230,6 +1357,7 @@ mod tests {
                     kind: Kind::Income,
                     amount: "10".parse().unwrap(),
                     date: "2026-09-29".into(),
+                    occurred_at: None,
                     category: None,
                     note: None,
                     channel: None,

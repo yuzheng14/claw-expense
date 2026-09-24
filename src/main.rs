@@ -14,6 +14,7 @@ use claw_expense::{
         UpdateTransaction,
     },
     money::Money,
+    occurrence::date_from_occurred_at,
     store::Store,
 };
 use serde_json::{Value, json};
@@ -52,8 +53,16 @@ impl From<EntryKind> for Kind {
 struct EntryArgs {
     #[arg(long, help = "正数金额，最多两位小数，例如 98.01")]
     amount: Money,
-    #[arg(long, default_value_t = today(), help = "实际发生日期 YYYY-MM-DD，默认本机今天")]
-    date: String,
+    #[arg(
+        long,
+        help = "实际发生日期 YYYY-MM-DD；省略时使用 occurred-at 的当地日期，否则本机今天"
+    )]
+    date: Option<String>,
+    #[arg(
+        long,
+        help = "可选实际发生时间，须含时区偏移，例如 2026-09-24T14:35+08:00"
+    )]
+    occurred_at: Option<String>,
     #[arg(long)]
     note: Option<String>,
     #[arg(long, help = "支付或收款渠道，仅作为备注，不计算账户余额")]
@@ -139,8 +148,13 @@ enum PendingCommand {
         currency: String,
         #[arg(long, help = "正数十进制字符串；USD 最多两位小数，JPY 必须为整数")]
         amount: String,
-        #[arg(long, default_value_t = today(), help = "实际消费日期 YYYY-MM-DD")]
-        date: String,
+        #[arg(
+            long,
+            help = "实际消费日期 YYYY-MM-DD；省略时从 occurred-at 推导，否则本机今天"
+        )]
+        date: Option<String>,
+        #[arg(long, help = "可选实际消费时间，须含时区偏移，支持分钟或秒精度")]
+        occurred_at: Option<String>,
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
@@ -254,6 +268,14 @@ enum Command {
         amount: Option<Money>,
         #[arg(long)]
         date: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "clear_occurred_at",
+            help = "补充或更正实际发生时间；省略 date 时从时间推导日期"
+        )]
+        occurred_at: Option<String>,
+        #[arg(long, help = "清除实际发生时间，保留日期；与 occurred-at 互斥")]
+        clear_occurred_at: bool,
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
@@ -302,6 +324,16 @@ enum Command {
 
 fn today() -> String {
     Local::now().date_naive().to_string()
+}
+
+fn entry_date(date: Option<String>, occurred_at: Option<&str>) -> Result<String> {
+    if let Some(date) = date {
+        Ok(date)
+    } else if let Some(occurred_at) = occurred_at {
+        date_from_occurred_at(occurred_at)
+    } else {
+        Ok(today())
+    }
 }
 
 fn database_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -355,7 +387,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let input = NewTransaction {
                 kind: kind.into(),
                 amount: entry.amount,
-                date: entry.date,
+                date: entry_date(entry.date, entry.occurred_at.as_deref())?,
+                occurred_at: entry.occurred_at,
                 category,
                 note: entry.note,
                 channel: entry.channel,
@@ -369,7 +402,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let input = NewTransaction {
                 kind: Kind::Refund,
                 amount: entry.amount,
-                date: entry.date,
+                date: entry_date(entry.date, entry.occurred_at.as_deref())?,
+                occurred_at: entry.occurred_at,
                 category: None,
                 note: entry.note,
                 channel: entry.channel,
@@ -407,6 +441,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             id,
             amount,
             date,
+            occurred_at,
+            clear_occurred_at,
             category,
             note,
             channel,
@@ -415,6 +451,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let patch = UpdateTransaction {
                 amount,
                 date,
+                occurred_at,
+                clear_occurred_at,
                 category,
                 note,
                 channel,
@@ -460,6 +498,7 @@ async fn execute_pending(store: &Store, command: PendingCommand) -> Result<Value
             currency,
             amount,
             date,
+            occurred_at,
             category,
             merchant,
             note,
@@ -471,7 +510,8 @@ async fn execute_pending(store: &Store, command: PendingCommand) -> Result<Value
                     NewPendingExpense {
                         currency,
                         amount,
-                        date,
+                        date: entry_date(date, occurred_at.as_deref())?,
+                        occurred_at,
                         category,
                         merchant,
                         note,
@@ -535,6 +575,14 @@ fn cell(value: &Value, key: &str) -> String {
         .collect()
 }
 
+fn occurrence_label(entry: &Value) -> String {
+    if entry.get("occurred_at").is_some_and(Value::is_string) {
+        cell(entry, "occurred_at")
+    } else {
+        cell(entry, "date")
+    }
+}
+
 fn entry_line(entry: &Value) -> String {
     let label = match entry.get("kind").and_then(Value::as_str) {
         Some("income") => "收入",
@@ -544,7 +592,7 @@ fn entry_line(entry: &Value) -> String {
     format!(
         "{}  {}  {} 元  {}  {}  {}{}",
         cell(entry, "id"),
-        cell(entry, "date"),
+        occurrence_label(entry),
         cell(entry, "amount"),
         label,
         cell(entry, "category"),
@@ -566,7 +614,7 @@ fn pending_line(entry: &Value) -> String {
     let mut text = format!(
         "{}  {}  {} {}  [{}]  {}  {}  {}",
         cell(entry, "id"),
-        cell(entry, "date"),
+        occurrence_label(entry),
         cell(entry, "amount"),
         cell(entry, "currency"),
         status,

@@ -39,6 +39,8 @@ pub struct NewTransaction {
     pub kind: Kind,
     pub amount: Money,
     pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
@@ -54,6 +56,10 @@ pub struct NewTransaction {
 pub struct UpdateTransaction {
     pub amount: Option<Money>,
     pub date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_occurred_at: bool,
     pub category: Option<String>,
     pub note: Option<String>,
     pub channel: Option<String>,
@@ -67,6 +73,8 @@ pub struct TransactionRecord {
     pub currency: String,
     pub category: String,
     pub date: String,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
     pub note: Option<String>,
     pub channel: Option<String>,
     pub original_id: Option<String>,
@@ -144,6 +152,8 @@ pub struct NewPendingExpense {
     pub currency: String,
     pub amount: String,
     pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
     pub category: Option<String>,
     pub merchant: Option<String>,
     pub note: Option<String>,
@@ -163,6 +173,8 @@ pub struct PendingExpenseRecord {
     pub currency: String,
     pub amount: String,
     pub date: String,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
     pub category: String,
     pub merchant: Option<String>,
     pub note: Option<String>,
@@ -238,4 +250,8 @@ pub struct AuditRecord {
     pub before: Option<serde_json::Value>,
     pub after: serde_json::Value,
     pub created_at: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

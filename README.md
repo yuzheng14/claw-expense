@@ -2,13 +2,11 @@
 
 给 OpenClaw 和人使用的本地记账 CLI。Rust + Clap + SQLx + SQLite，处理人民币收支、关联退款、外币待确认消费和查询汇总。
 
-> 外币待确认及可选实际发生时间目前在开发分支，尚未发布。`v0.1.0` Release 不包含 `pending` 命令或 `--occurred-at`；review 时请从本分支构建 CLI（下文“构建与运行”）。本 PR 不修改已发布的安装包或创建 Release。
-
 ## 安装 Skill（推荐）
 
 目前发布的二进制支持 **macOS ARM64 / Apple Silicon**，运行不需要 Rust 或独立 SQLite。
 
-从 [Release](https://github.com/yuzheng14/claw-expense/releases/latest) 下载 `claw-expense-skill-v0.1.0.tar.gz`，解压后将其中的 `claw-expense` 目录安装到 OpenClaw：
+从 [Release](https://github.com/yuzheng14/claw-expense/releases/latest) 下载 `claw-expense-skill-<tag>.tar.gz`（`<tag>` 为所选 Release 的版本标签），解压后将其中的 `claw-expense` 目录安装到 OpenClaw：
 
 ```bash
 openclaw skills install ./claw-expense --as claw-expense
@@ -30,7 +28,7 @@ bash skills/claw-expense/scripts/run.sh --db ./ledger.sqlite init
 
 `CLAW_EXPENSE_INSTALL_DIR` 可指定可写安装目录。默认下载版本来自 Skill 的 `VERSION` 文件；`CLAW_EXPENSE_VERSION=vX.Y.Z` 可显式选择缺失时下载的版本。已有可用 CLI 会复用，不自动升级或覆盖；脚本不使用 sudo、不修改 shell 配置。当前不为 Linux 或 Intel Mac 提供自动下载包。
 
-直接使用 CLI 的用户，也可以从同一 Release 下载 `claw-expense-v0.1.0-aarch64-apple-darwin.tar.gz`，用 `SHA256SUMS` 校验并解压后运行其中的 `claw-expense`。
+直接使用 CLI 的用户，也可以从同一 Release 下载 `claw-expense-<tag>-aarch64-apple-darwin.tar.gz`，用 `SHA256SUMS` 校验并解压后运行其中的 `claw-expense`。
 
 ## 构建与运行
 
@@ -296,13 +294,13 @@ cargo clippy --all-targets --locked -- -D warnings
 
 ## 发版
 
-GitHub Actions 在 `main` 的 push 和 Pull Request 上执行 CI；推送 `vX.Y.Z` 标签触发 Release 流水线。流水线在 macOS ARM64 上检查格式、测试、Clippy，构建 `aarch64-apple-darwin` 二进制，再发布：
+GitHub Actions 在分支 push 和 Pull Request 上执行 CI；推送 `vX.Y.Z` 标签触发 Release 流水线。流水线在 macOS ARM64 上检查格式、测试、Clippy，构建 `aarch64-apple-darwin` 二进制，再发布：
 
 - `claw-expense-vX.Y.Z-aarch64-apple-darwin.tar.gz`：CLI、MIT LICENSE 和 README。
 - `claw-expense-skill-vX.Y.Z.tar.gz`：可单独安装的完整 Skill，包括自动安装脚本。
 - `SHA256SUMS`：上述归档的 SHA-256 校验值。
 
-发版前同步修改 `Cargo.toml` 的版本、`Cargo.lock`、`skills/claw-expense/VERSION`，并更新版本示例和变更说明；版本号必须与标签一致。流水线不会覆盖已经存在的 Release。发布构建和打包入口见 [.github/workflows/release.yml](.github/workflows/release.yml) 与 [scripts/package-release.sh](scripts/package-release.sh)。
+发版前同步修改 `Cargo.toml` 的版本、`Cargo.lock`、`skills/claw-expense/VERSION`，并更新变更说明；版本号必须与标签一致。流水线不会覆盖已经存在的 Release。发布构建和打包入口见 [.github/workflows/release.yml](.github/workflows/release.yml) 与 [scripts/package-release.sh](scripts/package-release.sh)。
 
 ## 协议
 

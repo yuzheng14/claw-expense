@@ -9,8 +9,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use claw_expense::{
     archive,
     error::{AppError, Result},
-    models::{Filters, Kind, NewTransaction, UpdateTransaction},
+    models::{
+        ConfirmPendingExpense, Filters, Kind, NewPendingExpense, NewTransaction, PendingFilters,
+        UpdateTransaction,
+    },
     money::Money,
+    occurrence::date_from_occurred_at,
     store::Store,
 };
 use serde_json::{Value, json};
@@ -59,8 +63,16 @@ impl From<EntryKind> for Kind {
 struct EntryArgs {
     #[arg(long, help = "正数金额，最多两位小数，例如 98.01")]
     amount: Money,
-    #[arg(long, default_value_t = today(), help = "实际发生日期 YYYY-MM-DD，默认本机今天")]
-    date: String,
+    #[arg(
+        long,
+        help = "实际发生日期 YYYY-MM-DD；省略时使用 occurred-at 的当地日期，否则本机今天"
+    )]
+    date: Option<String>,
+    #[arg(
+        long,
+        help = "可选实际发生时间，须含时区偏移，例如 2026-09-24T14:35+08:00"
+    )]
+    occurred_at: Option<String>,
     #[arg(long)]
     note: Option<String>,
     #[arg(long, help = "支付或收款渠道，仅作为备注，不计算账户余额")]
@@ -79,7 +91,7 @@ struct FilterArgs {
     to: Option<String>,
     #[arg(long)]
     category: Option<String>,
-    #[arg(long, help = "按 ID、备注或渠道查找")]
+    #[arg(long, help = "按 ID、备注、渠道或外币消费商户查找")]
     search: Option<String>,
 }
 
@@ -107,6 +119,110 @@ enum CategoryCommand {
         #[arg(long, value_enum)]
         kind: EntryKind,
     },
+}
+
+#[derive(Args)]
+struct PendingListArgs {
+    #[command(flatten)]
+    filter: FilterArgs,
+    #[arg(long, help = "原币币种，例如 USD、JPY")]
+    currency: Option<String>,
+    #[arg(long, default_value_t = today(), help = "查询基准日期 YYYY-MM-DD，默认本机今天")]
+    as_of: String,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(i64).range(1..=1000))]
+    limit: i64,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    offset: i64,
+}
+
+impl PendingListArgs {
+    fn filters(self, status: Option<String>, due_only: bool) -> PendingFilters {
+        let mut filters = self.filter.filters();
+        filters.limit = self.limit;
+        filters.offset = self.offset;
+        PendingFilters {
+            filters,
+            status,
+            currency: self.currency,
+            as_of: self.as_of,
+            due_only,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PendingCommand {
+    /// 消费时先记录原币金额，人民币金额暂不计入收支
+    Add {
+        #[arg(long)]
+        currency: String,
+        #[arg(long, help = "正数十进制字符串；USD 最多两位小数，JPY 必须为整数")]
+        amount: String,
+        #[arg(
+            long,
+            help = "实际消费日期 YYYY-MM-DD；省略时从 occurred-at 推导，否则本机今天"
+        )]
+        date: Option<String>,
+        #[arg(long, help = "可选实际消费时间，须含时区偏移，支持分钟或秒精度")]
+        occurred_at: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        merchant: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 从 stdin 或文件读取待确认账单 JSON；原币金额为字符串，日期必填
+    Record {
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 按消费日期由旧到新查询，默认只显示待确认记录
+    List {
+        #[command(flatten)]
+        query: PendingListArgs,
+        #[arg(long, value_parser = ["pending", "confirmed", "cancelled", "all"])]
+        status: Option<String>,
+    },
+    /// 查询到期需提醒的待确认账单；只读，不代表已发送提醒
+    Due {
+        #[command(flatten)]
+        query: PendingListArgs,
+    },
+    /// 查看原币信息，以及已确认后关联的人民币支出
+    Show { id: String },
+    /// 补齐银行实际人民币金额，只生成一笔关联支出，仍归原消费日期
+    Confirm {
+        id: String,
+        #[arg(long, help = "实际人民币金额，最多两位小数，不是汇率")]
+        amount: Money,
+        #[arg(long, help = "银行实际入账日 YYYY-MM-DD；不知道时省略")]
+        posted_date: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 取消未确认且未实际扣款的消费，保留历史
+    Cancel {
+        id: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 将未确认账单的下次提醒日设为指定日期
+    Snooze {
+        id: String,
+        #[arg(long, help = "下次提醒日 YYYY-MM-DD，含当天")]
+        until: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 查看待确认账单的创建、确认、取消和延后提醒历史
+    History { id: String },
 }
 
 #[derive(Subcommand)]
@@ -162,6 +278,14 @@ enum Command {
         amount: Option<Money>,
         #[arg(long)]
         date: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "clear_occurred_at",
+            help = "补充或更正实际发生时间；省略 date 时从时间推导日期"
+        )]
+        occurred_at: Option<String>,
+        #[arg(long, help = "清除实际发生时间，保留日期；与 occurred-at 互斥")]
+        clear_occurred_at: bool,
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
@@ -186,6 +310,11 @@ enum Command {
         #[command(subcommand)]
         command: CategoryCommand,
     },
+    /// 外币消费先记录，人民币金额确定后确认入账
+    Pending {
+        #[command(subcommand)]
+        command: PendingCommand,
+    },
     /// 完整导出 JSON（包含作废记录、审计和请求标识），不覆盖文件
     Export {
         #[arg(long)]
@@ -207,12 +336,42 @@ fn today() -> String {
     Local::now().date_naive().to_string()
 }
 
+fn entry_date(date: Option<String>, occurred_at: Option<&str>) -> Result<String> {
+    if let Some(date) = date {
+        Ok(date)
+    } else if let Some(occurred_at) = occurred_at {
+        date_from_occurred_at(occurred_at)
+    } else {
+        Ok(today())
+    }
+}
+
 fn database_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     explicit.map(Ok).unwrap_or_else(|| {
         directories::ProjectDirs::from("", "", "claw-expense")
             .map(|dirs| dirs.data_local_dir().join("ledger.sqlite"))
             .ok_or_else(|| AppError::invalid("无法确定数据目录，请用 --db 指定数据库文件"))
     })
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(input: Option<PathBuf>) -> Result<T> {
+    let reader: Box<dyn Read> = if let Some(path) = input {
+        Box::new(std::fs::File::open(path)?)
+    } else {
+        if io::stdin().is_terminal() {
+            return Err(AppError::invalid(
+                "请通过管道传入 JSON，或使用 --input 文件路径",
+            ));
+        }
+        Box::new(io::stdin())
+    };
+    const MAX_INPUT: u64 = 1024 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(MAX_INPUT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INPUT {
+        return Err(AppError::invalid("JSON 输入不能超过 1 MiB"));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn run(cli: Cli) -> Result<Value> {
@@ -238,7 +397,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let input = NewTransaction {
                 kind: kind.into(),
                 amount: entry.amount,
-                date: entry.date,
+                date: entry_date(entry.date, entry.occurred_at.as_deref())?,
+                occurred_at: entry.occurred_at,
                 category,
                 note: entry.note,
                 channel: entry.channel,
@@ -252,7 +412,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let input = NewTransaction {
                 kind: Kind::Refund,
                 amount: entry.amount,
-                date: entry.date,
+                date: entry_date(entry.date, entry.occurred_at.as_deref())?,
+                occurred_at: entry.occurred_at,
                 category: None,
                 note: entry.note,
                 channel: entry.channel,
@@ -263,23 +424,7 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             )?)
         }
         Command::Record { input, request_id } => {
-            let reader: Box<dyn Read> = if let Some(path) = input {
-                Box::new(std::fs::File::open(path)?)
-            } else {
-                if io::stdin().is_terminal() {
-                    return Err(AppError::invalid(
-                        "请通过管道传入 JSON，或使用 --input 文件路径",
-                    ));
-                }
-                Box::new(io::stdin())
-            };
-            const MAX_INPUT: u64 = 1024 * 1024;
-            let mut bytes = Vec::new();
-            reader.take(MAX_INPUT + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_INPUT {
-                return Err(AppError::invalid("JSON 输入不能超过 1 MiB"));
-            }
-            let input: NewTransaction = serde_json::from_slice(&bytes)?;
+            let input: NewTransaction = read_json(input)?;
             Ok(serde_json::to_value(
                 store.add(input, request_id.as_deref()).await?,
             )?)
@@ -306,6 +451,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             id,
             amount,
             date,
+            occurred_at,
+            clear_occurred_at,
             category,
             note,
             channel,
@@ -314,6 +461,8 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             let patch = UpdateTransaction {
                 amount,
                 date,
+                occurred_at,
+                clear_occurred_at,
                 category,
                 note,
                 channel,
@@ -338,16 +487,93 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
                 store.add_category(&name, kind.into()).await?,
             )?),
         },
+        Command::Pending { command } => execute_pending(store, command).await,
         Command::Backup { output } => {
             archive::backup(store, &output).await?;
             Ok(json!({"output": output, "format": "sqlite"}))
         }
         Command::Export { output } => {
             archive::export(store, &output).await?;
-            Ok(json!({"output": output, "format": "claw-expense-export", "version": 1}))
+            Ok(json!({"output": output, "format": "claw-expense-export", "version": 2}))
         }
         Command::Restore { .. } => {
             unreachable!("restore is handled before opening the destination")
+        }
+    }
+}
+
+async fn execute_pending(store: &Store, command: PendingCommand) -> Result<Value> {
+    match command {
+        PendingCommand::Add {
+            currency,
+            amount,
+            date,
+            occurred_at,
+            category,
+            merchant,
+            note,
+            channel,
+            request_id,
+        } => Ok(serde_json::to_value(
+            store
+                .add_pending(
+                    NewPendingExpense {
+                        currency,
+                        amount,
+                        date: entry_date(date, occurred_at.as_deref())?,
+                        occurred_at,
+                        category,
+                        merchant,
+                        note,
+                        channel,
+                    },
+                    request_id.as_deref(),
+                )
+                .await?,
+        )?),
+        PendingCommand::Record { input, request_id } => Ok(serde_json::to_value(
+            store
+                .add_pending(read_json(input)?, request_id.as_deref())
+                .await?,
+        )?),
+        PendingCommand::List { query, status } => Ok(serde_json::to_value(
+            store.list_pending(&query.filters(status, false)).await?,
+        )?),
+        PendingCommand::Due { query } => Ok(serde_json::to_value(
+            store.list_pending(&query.filters(None, true)).await?,
+        )?),
+        PendingCommand::Show { id } => Ok(serde_json::to_value(store.get_pending(&id).await?)?),
+        PendingCommand::Confirm {
+            id,
+            amount,
+            posted_date,
+            request_id,
+        } => Ok(serde_json::to_value(
+            store
+                .confirm_pending(
+                    &id,
+                    ConfirmPendingExpense {
+                        amount,
+                        posted_date,
+                    },
+                    request_id.as_deref(),
+                )
+                .await?,
+        )?),
+        PendingCommand::Cancel { id, request_id } => Ok(serde_json::to_value(
+            store.cancel_pending(&id, request_id.as_deref()).await?,
+        )?),
+        PendingCommand::Snooze {
+            id,
+            until,
+            request_id,
+        } => Ok(serde_json::to_value(
+            store
+                .snooze_pending(&id, &until, request_id.as_deref())
+                .await?,
+        )?),
+        PendingCommand::History { id } => {
+            Ok(serde_json::to_value(store.pending_history(&id).await?)?)
         }
     }
 }
@@ -359,6 +585,14 @@ fn cell(value: &Value, key: &str) -> String {
         .collect()
 }
 
+fn occurrence_label(entry: &Value) -> String {
+    if entry.get("occurred_at").is_some_and(Value::is_string) {
+        cell(entry, "occurred_at")
+    } else {
+        cell(entry, "date")
+    }
+}
+
 fn entry_line(entry: &Value) -> String {
     let label = match entry.get("kind").and_then(Value::as_str) {
         Some("income") => "收入",
@@ -368,7 +602,7 @@ fn entry_line(entry: &Value) -> String {
     format!(
         "{}  {}  {} 元  {}  {}  {}{}",
         cell(entry, "id"),
-        cell(entry, "date"),
+        occurrence_label(entry),
         cell(entry, "amount"),
         label,
         cell(entry, "category"),
@@ -381,11 +615,57 @@ fn entry_line(entry: &Value) -> String {
     )
 }
 
+fn pending_line(entry: &Value) -> String {
+    let status = match entry["status"].as_str() {
+        Some("confirmed") => "已确认",
+        Some("cancelled") => "已取消",
+        _ => "待确认人民币金额",
+    };
+    let mut text = format!(
+        "{}  {}  {} {}  [{}]  {}  {}  {}",
+        cell(entry, "id"),
+        occurrence_label(entry),
+        cell(entry, "amount"),
+        cell(entry, "currency"),
+        status,
+        cell(entry, "merchant"),
+        cell(entry, "category"),
+        cell(entry, "note"),
+    );
+    if entry["status"] == "pending" {
+        text.push_str(&format!("  提醒日 {}", cell(entry, "remind_on")));
+    }
+    text
+}
+
 fn human_output(data: &Value) -> Result<String> {
+    if let Some(pending) = data.get("pending") {
+        let mut text = pending_line(pending);
+        text.push('\n');
+        if data["replayed"] == true {
+            text.push_str("此前已处理，未重复执行；当前状态请用 pending show 查询。\n");
+        }
+        if data.get("transaction").is_some_and(Value::is_object) {
+            text.push_str("关联人民币账单：\n");
+            text.push_str(&entry_line(&data["transaction"]));
+            text.push('\n');
+        }
+        if pending["posted_date"].is_string() {
+            text.push_str(&format!("银行入账日 {}\n", cell(pending, "posted_date")));
+        }
+        if pending["confirmed_at"].is_string() {
+            text.push_str(&format!("确认时间 {}\n", cell(pending, "confirmed_at")));
+        }
+        return Ok(text);
+    }
     if let Some(items) = data.get("items").and_then(Value::as_array) {
         let mut text = format!("共 {} 笔，当前显示 {} 笔\n", data["total"], items.len());
         for item in items {
-            text.push_str(&entry_line(item));
+            if item.get("status").is_some() {
+                text.push_str(&pending_line(item));
+            } else {
+                text.push_str(&entry_line(item));
+            }
             text.push('\n');
         }
         return Ok(text);
@@ -410,6 +690,20 @@ fn human_output(data: &Value) -> Result<String> {
                 cell(item, "net_expense")
             ));
         }
+        if data["pending_count"].as_i64().unwrap_or(0) > 0 {
+            text.push_str(&format!(
+                "另有 {} 笔外币消费待确认，尚未计入人民币收支：\n",
+                data["pending_count"]
+            ));
+            for item in data["pending_by_currency"].as_array().into_iter().flatten() {
+                text.push_str(&format!(
+                    "{} {}（{} 笔）\n",
+                    cell(item, "amount"),
+                    cell(item, "currency"),
+                    item["count"]
+                ));
+            }
+        }
         return Ok(text);
     }
     if let Some(entry) = data.get("transaction") {
@@ -417,6 +711,11 @@ fn human_output(data: &Value) -> Result<String> {
         text.push('\n');
         if data["replayed"] == true {
             text.push_str("重复请求：返回原操作结果，未重复执行。\n");
+        }
+        if data.get("foreign_expense").is_some_and(Value::is_object) {
+            text.push_str("原币消费：\n");
+            text.push_str(&pending_line(&data["foreign_expense"]));
+            text.push('\n');
         }
         if let Some(total) = data.get("refund_total") {
             text.push_str(&format!("累计退回 {} 元", total.as_str().unwrap_or("0.00")));

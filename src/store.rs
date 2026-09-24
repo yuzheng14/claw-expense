@@ -11,10 +11,11 @@ use crate::{
     error::{AppError, Result},
     models::*,
     money::{Money, format_minor},
+    occurrence::{date_from_occurred_at, normalize_occurred_at, validate_occurrence},
 };
 
 const APPLICATION_ID: i64 = 1129071960;
-const SELECT_RECORD: &str = "SELECT t.id, t.kind, t.amount_minor, t.currency, COALESCE(t.category, original.category) AS category, t.date, t.note, t.channel, t.original_id, t.voided, t.created_at, t.updated_at FROM transactions t LEFT JOIN transactions original ON t.original_id = original.id";
+const SELECT_RECORD: &str = "SELECT t.id, t.kind, t.amount_minor, t.currency, COALESCE(t.category, original.category) AS category, t.date, t.occurred_at, t.note, t.channel, t.original_id, t.voided, t.created_at, t.updated_at FROM transactions t LEFT JOIN transactions original ON t.original_id = original.id";
 
 pub struct Store {
     pub pool: SqlitePool,
@@ -78,11 +79,11 @@ impl Store {
 
     pub async fn add(
         &self,
-        input: NewTransaction,
+        mut input: NewTransaction,
         request_id: Option<&str>,
     ) -> Result<WriteResult> {
         validate_amount(input.amount)?;
-        validate_date(&input.date)?;
+        input.occurred_at = validate_occurrence(&input.date, input.occurred_at.as_deref())?;
         validate_request_id(request_id)?;
         if input.kind == Kind::Refund {
             if input.original_id.as_deref().is_none_or(str::is_empty) {
@@ -124,9 +125,9 @@ impl Store {
         };
         let id = format!("txn_{}", uuid::Uuid::new_v4().simple());
         let now = now();
-        sqlx::query("INSERT INTO transactions (id, kind, amount_minor, category, date, note, channel, original_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO transactions (id, kind, amount_minor, category, date, occurred_at, note, channel, original_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&id).bind(input.kind.as_str()).bind(input.amount.minor())
-            .bind(category).bind(&input.date).bind(clean_optional(input.note))
+            .bind(category).bind(&input.date).bind(&input.occurred_at).bind(clean_optional(input.note))
             .bind(clean_optional(input.channel)).bind(input.original_id)
             .bind(&now).bind(&now).execute(&mut *tx).await?;
         let record = fetch_record(&mut tx, &id).await?;
@@ -144,7 +145,7 @@ impl Store {
     pub async fn update(
         &self,
         id: &str,
-        patch: UpdateTransaction,
+        mut patch: UpdateTransaction,
         request_id: Option<&str>,
     ) -> Result<WriteResult> {
         validate_request_id(request_id)?;
@@ -153,6 +154,8 @@ impl Store {
             && patch.category.is_none()
             && patch.note.is_none()
             && patch.channel.is_none()
+            && patch.occurred_at.is_none()
+            && !patch.clear_occurred_at
         {
             return Err(AppError::invalid("修改至少需要提供一个字段"));
         }
@@ -161,6 +164,21 @@ impl Store {
         }
         if let Some(date) = &patch.date {
             validate_date(date)?;
+        }
+        if patch.clear_occurred_at && patch.occurred_at.is_some() {
+            return Err(AppError::invalid(
+                "occurred-at 与 clear-occurred-at 不能同时使用",
+            ));
+        }
+        if let Some(value) = &patch.occurred_at {
+            let normalized = normalize_occurred_at(value)?;
+            let date = patch
+                .date
+                .clone()
+                .unwrap_or(date_from_occurred_at(&normalized)?);
+            validate_occurrence(&date, Some(&normalized))?;
+            patch.date = Some(date);
+            patch.occurred_at = Some(normalized);
         }
         let payload = serde_json::to_string(
             &serde_json::json!({"operation": "update", "id": id, "patch": patch}),
@@ -182,6 +200,17 @@ impl Store {
         }
         let amount = patch.amount.unwrap_or(before.amount);
         let date = patch.date.as_deref().unwrap_or(&before.date);
+        let occurred_at = if patch.clear_occurred_at {
+            None
+        } else {
+            validate_occurrence(
+                date,
+                patch
+                    .occurred_at
+                    .as_deref()
+                    .or(before.occurred_at.as_deref()),
+            )?
+        };
         let category = if before.kind == Kind::Refund {
             None
         } else {
@@ -195,8 +224,8 @@ impl Store {
             Some(value) => clean_optional(Some(value)),
             None => before.channel.clone(),
         };
-        sqlx::query("UPDATE transactions SET amount_minor = ?, date = ?, category = ?, note = ?, channel = ?, updated_at = ? WHERE id = ?")
-            .bind(amount.minor()).bind(date).bind(category).bind(note).bind(channel).bind(now()).bind(id)
+        sqlx::query("UPDATE transactions SET amount_minor = ?, date = ?, occurred_at = ?, category = ?, note = ?, channel = ?, updated_at = ? WHERE id = ?")
+            .bind(amount.minor()).bind(date).bind(occurred_at).bind(category).bind(note).bind(channel).bind(now()).bind(id)
             .execute(&mut *tx).await?;
         let after = fetch_record(&mut tx, id).await?;
         audit(&mut tx, "update", Some(&before), &after).await?;
@@ -298,6 +327,7 @@ impl Store {
         } else {
             (None, None, 0)
         };
+        let foreign_expense = crate::foreign::find_by_transaction(&mut tx, id).await?;
         tx.commit().await?;
         Ok(TransactionDetail {
             transaction,
@@ -306,6 +336,7 @@ impl Store {
             net_expense: net,
             refund_status: status,
             excess_refund: format_minor(excess),
+            foreign_expense,
         })
     }
 
@@ -357,7 +388,8 @@ impl Store {
             "SELECT t.kind, t.amount_minor, COALESCE(t.category, original.category) AS category FROM transactions t LEFT JOIN transactions original ON t.original_id = original.id",
         );
         push_filters(&mut query, filters, false);
-        let mut rows = query.build().fetch(&self.pool);
+        let mut tx = self.pool.begin().await?;
+        let mut rows = query.build().fetch(&mut *tx);
         let mut totals = Totals::default();
         let mut categories: BTreeMap<String, Totals> = BTreeMap::new();
         let mut count = 0_i64;
@@ -371,6 +403,10 @@ impl Store {
                 .add(kind, amount)?;
             count = count.checked_add(1).ok_or_else(overflow)?;
         }
+        drop(rows);
+        let (pending_count, pending_by_currency) =
+            crate::foreign::pending_totals(&mut tx, filters).await?;
+        tx.commit().await?;
         let by_category = categories
             .into_iter()
             .map(|(category, totals)| {
@@ -392,6 +428,8 @@ impl Store {
             net_expense: format_minor(totals.net()?),
             balance: format_minor(checked_sub(totals.income, totals.net()?)?),
             by_category,
+            pending_count,
+            pending_by_currency,
         })
     }
 
@@ -469,28 +507,28 @@ impl Store {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
-fn clean_optional(value: Option<String>) -> Option<String> {
+pub(crate) fn clean_optional(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 fn overflow() -> AppError {
     AppError::new("AMOUNT_OVERFLOW", "金额汇总超出可表示范围")
 }
-fn checked_add(left: i128, right: i128) -> Result<i128> {
+pub(crate) fn checked_add(left: i128, right: i128) -> Result<i128> {
     left.checked_add(right).ok_or_else(overflow)
 }
 fn checked_sub(left: i128, right: i128) -> Result<i128> {
     left.checked_sub(right).ok_or_else(overflow)
 }
-fn validate_amount(amount: Money) -> Result<()> {
+pub(crate) fn validate_amount(amount: Money) -> Result<()> {
     if amount.minor() <= 0 {
         return Err(AppError::invalid("单笔金额必须大于零"));
     }
     Ok(())
 }
-fn validate_request_id(id: Option<&str>) -> Result<()> {
+pub(crate) fn validate_request_id(id: Option<&str>) -> Result<()> {
     if id.is_some_and(|id| id.trim().is_empty() || id.len() > 200) {
         return Err(AppError::invalid(
             "request-id 必须为 1..200 字节的非空字符串",
@@ -498,7 +536,7 @@ fn validate_request_id(id: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-fn validate_date(value: &str) -> Result<()> {
+pub(crate) fn validate_date(value: &str) -> Result<()> {
     if value.len() != 10
         || !value.bytes().enumerate().all(|(i, byte)| {
             if i == 4 || i == 7 {
@@ -516,7 +554,7 @@ fn validate_date(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_filters(filters: &Filters) -> Result<()> {
+pub(crate) fn validate_filters(filters: &Filters) -> Result<()> {
     if let Some(month) = &filters.month {
         if month.len() != 7 {
             return Err(AppError::invalid("月份必须为 YYYY-MM"));
@@ -567,7 +605,11 @@ fn push_filters(query: &mut QueryBuilder<Sqlite>, filters: &Filters, include_voi
             .push_bind(keyword)
             .push(") > 0 OR instr(COALESCE(t.channel, ''), ")
             .push_bind(keyword)
-            .push(") > 0)");
+            .push(") > 0 OR EXISTS (SELECT 1 FROM pending_expenses p WHERE (p.transaction_id = t.id OR p.transaction_id = t.original_id) AND (instr(COALESCE(p.merchant, ''), ")
+            .push_bind(keyword)
+            .push(") > 0 OR instr(p.id, ")
+            .push_bind(keyword)
+            .push(") > 0)))");
     }
 }
 
@@ -579,6 +621,7 @@ fn decode_record(row: &SqliteRow) -> Result<TransactionRecord> {
         currency: row.try_get("currency")?,
         category: row.try_get("category")?,
         date: row.try_get("date")?,
+        occurred_at: row.try_get("occurred_at")?,
         note: row.try_get("note")?,
         channel: row.try_get("channel")?,
         original_id: row.try_get("original_id")?,
@@ -587,7 +630,10 @@ fn decode_record(row: &SqliteRow) -> Result<TransactionRecord> {
         updated_at: row.try_get("updated_at")?,
     })
 }
-async fn fetch_record(conn: &mut SqliteConnection, id: &str) -> Result<TransactionRecord> {
+pub(crate) async fn fetch_record(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<TransactionRecord> {
     let mut query = QueryBuilder::<Sqlite>::new(SELECT_RECORD);
     query.push(" WHERE t.id = ").push_bind(id);
     let row = query
@@ -597,7 +643,11 @@ async fn fetch_record(conn: &mut SqliteConnection, id: &str) -> Result<Transacti
         .ok_or_else(|| AppError::new("NOT_FOUND", format!("账单不存在：{id}")))?;
     decode_record(&row)
 }
-async fn require_category(conn: &mut SqliteConnection, name: &str, kind: Kind) -> Result<()> {
+pub(crate) async fn require_category(
+    conn: &mut SqliteConnection,
+    name: &str,
+    kind: Kind,
+) -> Result<()> {
     let existing: Option<String> = sqlx::query_scalar("SELECT kind FROM categories WHERE name = ?")
         .bind(name)
         .fetch_optional(conn)
@@ -609,7 +659,7 @@ async fn require_category(conn: &mut SqliteConnection, name: &str, kind: Kind) -
     }
     Ok(())
 }
-async fn audit(
+pub(crate) async fn audit(
     conn: &mut SqliteConnection,
     action: &str,
     before: Option<&TransactionRecord>,
@@ -658,11 +708,11 @@ async fn replay(
     result.replayed = true;
     Ok(Some(result))
 }
-async fn save_request(
+pub(crate) async fn save_request<T: serde::Serialize>(
     conn: &mut SqliteConnection,
     request_id: Option<&str>,
     payload: &str,
-    result: &WriteResult,
+    result: &T,
 ) -> Result<()> {
     if let Some(id) = request_id {
         sqlx::query("INSERT INTO idempotency (request_id, payload, response_json, created_at) VALUES (?, ?, ?, ?)")
@@ -709,6 +759,7 @@ mod tests {
             kind: Kind::Expense,
             amount: amount.parse().unwrap(),
             date: date.to_owned(),
+            occurred_at: None,
             category: Some("购物".to_owned()),
             note: None,
             channel: Some("银行卡".to_owned()),
@@ -721,6 +772,7 @@ mod tests {
             kind: Kind::Refund,
             amount: amount.parse().unwrap(),
             date: date.to_owned(),
+            occurred_at: None,
             category: None,
             note: None,
             channel: Some("微信".to_owned()),
@@ -733,6 +785,257 @@ mod tests {
             month: Some(month.to_owned()),
             ..Filters::default()
         }
+    }
+
+    #[tokio::test]
+    async fn occurrence_time_preserves_precision_local_date_and_canonical_replay() {
+        let (_directory, store) = ledger().await;
+        let mut input = expense("20", "2026-09-30");
+        input.occurred_at = Some("2026-09-30T23:30:12.123456789-07:00".into());
+        let txn = store
+            .add(input.clone(), Some("with-time"))
+            .await
+            .unwrap()
+            .transaction;
+        assert_eq!(txn.occurred_at, input.occurred_at);
+        assert_eq!(
+            store.get(&txn.id).await.unwrap().transaction.occurred_at,
+            input.occurred_at
+        );
+        assert_eq!(
+            store.list(&Filters::default()).await.unwrap().items[0].occurred_at,
+            input.occurred_at
+        );
+        assert_eq!(
+            store.summary(&month("2026-09")).await.unwrap().expense,
+            "20.00"
+        );
+        assert_eq!(
+            store.summary(&month("2026-10")).await.unwrap().expense,
+            "0.00"
+        );
+        assert_eq!(
+            store.history(&txn.id).await.unwrap()[0].after["occurred_at"],
+            "2026-09-30T23:30:12.123456789-07:00"
+        );
+        input.date = "2026-10-01".into();
+        assert!(store.add(input, None).await.is_err());
+        let mut utc = expense("1", "2026-09-30");
+        utc.occurred_at = Some("2026-09-30T10:30+00:00".into());
+        let first = store.add(utc.clone(), Some("utc")).await.unwrap();
+        assert_eq!(
+            first.transaction.occurred_at.as_deref(),
+            Some("2026-09-30T10:30Z")
+        );
+        utc.occurred_at = Some("2026-09-30T10:30Z".into());
+        let replay = store.add(utc, Some("utc")).await.unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.transaction.id, first.transaction.id);
+        let mut refund = refund(&txn.id, "21", "2026-10-01");
+        refund.occurred_at = Some("2026-10-01T12:30+08:00".into());
+        let refund = store.add(refund, None).await.unwrap();
+        assert_eq!(
+            refund.transaction.occurred_at.as_deref(),
+            Some("2026-10-01T12:30+08:00")
+        );
+        assert_eq!(
+            store.get(&txn.id).await.unwrap().net_expense.as_deref(),
+            Some("-1.00")
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_time_derives_date_and_clear_time_is_explicit_atomic_and_audited() {
+        let (_directory, store) = ledger().await;
+        let id = store
+            .add(expense("1", "2026-09-01"), None)
+            .await
+            .unwrap()
+            .transaction
+            .id;
+        let timed = store
+            .update(
+                &id,
+                UpdateTransaction {
+                    occurred_at: Some("2026-09-30T23:30+00:00".into()),
+                    ..Default::default()
+                },
+                Some("set-time"),
+            )
+            .await
+            .unwrap()
+            .transaction;
+        assert_eq!(timed.date, "2026-09-30");
+        assert_eq!(timed.occurred_at.as_deref(), Some("2026-09-30T23:30Z"));
+        let replay = store
+            .update(
+                &id,
+                UpdateTransaction {
+                    occurred_at: Some("2026-09-30T23:30Z".into()),
+                    date: Some("2026-09-30".into()),
+                    ..Default::default()
+                },
+                Some("set-time"),
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        for patch in [
+            UpdateTransaction {
+                date: Some("2026-10-01".into()),
+                ..Default::default()
+            },
+            UpdateTransaction {
+                date: Some("2026-10-01".into()),
+                occurred_at: Some("2026-09-30T23:30Z".into()),
+                ..Default::default()
+            },
+            UpdateTransaction {
+                clear_occurred_at: true,
+                occurred_at: Some("2026-09-30T23:30Z".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                store
+                    .update(&id, patch, Some("invalid-edit"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(store.history(&id).await.unwrap().len(), 2);
+        let current = store.get(&id).await.unwrap().transaction;
+        assert_eq!(current.date, timed.date);
+        assert_eq!(current.occurred_at, timed.occurred_at);
+        let changed = store
+            .update(
+                &id,
+                UpdateTransaction {
+                    occurred_at: Some("2026-10-01T00:30:12+14:00".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        assert_eq!(changed.date, "2026-10-01");
+        assert_eq!(
+            store.summary(&month("2026-10")).await.unwrap().expense,
+            "1.00"
+        );
+        let cleared = store
+            .update(
+                &id,
+                UpdateTransaction {
+                    clear_occurred_at: true,
+                    ..Default::default()
+                },
+                Some("clear"),
+            )
+            .await
+            .unwrap()
+            .transaction;
+        assert!(cleared.occurred_at.is_none());
+        assert_eq!(cleared.date, "2026-10-01");
+        assert!(
+            store
+                .update(
+                    &id,
+                    UpdateTransaction {
+                        clear_occurred_at: true,
+                        ..Default::default()
+                    },
+                    Some("clear")
+                )
+                .await
+                .unwrap()
+                .replayed
+        );
+        let history = store.history(&id).await.unwrap();
+        assert_eq!(history.len(), 4);
+        assert_eq!(
+            history[3].before.as_ref().unwrap()["occurred_at"],
+            "2026-10-01T00:30:12+14:00"
+        );
+        assert!(history[3].after["occurred_at"].is_null());
+        store
+            .update(
+                &id,
+                UpdateTransaction {
+                    date: Some("2026-10-02".into()),
+                    occurred_at: Some("2026-10-02T12:00Z".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let cleared = store
+            .update(
+                &id,
+                UpdateTransaction {
+                    date: Some("2026-11-01".into()),
+                    clear_occurred_at: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        assert_eq!(cleared.date, "2026-11-01");
+        assert!(cleared.occurred_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn untimed_requests_keep_old_payload_shape_and_replay_old_snapshots() {
+        let (_directory, store) = ledger().await;
+        let input = expense("20", "2026-09-30");
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            serde_json::json!({
+                "kind": "expense", "amount": "20.00", "date": "2026-09-30", "category": "购物",
+                "note": null, "channel": "银行卡", "original_id": null
+            })
+        );
+        let patch = UpdateTransaction {
+            note: Some("changed".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({
+                "amount": null, "date": null, "category": null, "note": "changed", "channel": null
+            })
+        );
+        let added = store.add(input.clone(), Some("legacy-add")).await.unwrap();
+        assert!(added.transaction.occurred_at.is_none());
+        store
+            .update(&added.transaction.id, patch.clone(), Some("legacy-update"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE idempotency SET response_json = json_remove(response_json, '$.transaction.occurred_at')")
+            .execute(&store.pool).await.unwrap();
+        let replay = store.add(input, Some("legacy-add")).await.unwrap();
+        assert!(replay.replayed);
+        assert!(replay.transaction.occurred_at.is_none());
+        assert!(replay.transaction.note.is_none());
+        assert!(
+            store
+                .update(&added.transaction.id, patch, Some("legacy-update"))
+                .await
+                .unwrap()
+                .replayed
+        );
+        let current = store.get(&added.transaction.id).await.unwrap().transaction;
+        assert!(serde_json::to_value(current).unwrap()["occurred_at"].is_null());
+        assert!(
+            sqlx::query("UPDATE transactions SET occurred_at = '2026-10-01T12:00Z'")
+                .execute(&store.pool)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

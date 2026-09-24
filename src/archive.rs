@@ -115,7 +115,10 @@ pub async fn restore(input: &Path, output: &Path) -> Result<()> {
             .iter()
             .filter(|migration| !migration.migration_type.is_down_migration())
             .collect();
-        if applied.len() != expected.len() {
+        // A backup from an older release is compatible only when its entire
+        // migration history is an exact, non-empty prefix of this release's.
+        // The restored copy is upgraded by Store::open, never the source file.
+        if applied.is_empty() || applied.len() > expected.len() {
             return Err(AppError::new(
                 "UNSUPPORTED_BACKUP",
                 "备份迁移记录与当前程序不兼容",
@@ -149,6 +152,14 @@ pub async fn export(store: &Store, output: &Path) -> Result<()> {
         ("categories", "SELECT * FROM categories ORDER BY name"),
         ("transactions", "SELECT * FROM transactions ORDER BY id"),
         ("audit_log", "SELECT * FROM audit_log ORDER BY id"),
+        (
+            "pending_expenses",
+            "SELECT * FROM pending_expenses ORDER BY id",
+        ),
+        (
+            "pending_audit_log",
+            "SELECT * FROM pending_audit_log ORDER BY id",
+        ),
         (
             "idempotency",
             "SELECT * FROM idempotency ORDER BY request_id",
@@ -187,9 +198,17 @@ pub async fn export(store: &Store, output: &Path) -> Result<()> {
     transaction.commit().await?;
     let document = json!({
         "format": "claw-expense-export",
-        "version": 1,
-        "currency": "CNY",
-        "amount_unit": "fen",
+        "version": 2,
+        "base_currency": "CNY",
+        "amount_units": {
+            "transactions.amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
+            "pending_expenses.confirmed_amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
+            "pending_expenses.amount_minor": {
+                "currency_column": "currency",
+                "unit": "currency_minor",
+                "exponents": crate::foreign::SUPPORTED_CURRENCIES.iter().copied().collect::<std::collections::BTreeMap<_, _>>()
+            }
+        },
         "integer_encoding": "decimal_string",
         "created_at": Utc::now().to_rfc3339(),
         "tables": tables
@@ -213,6 +232,7 @@ mod tests {
             kind: Kind::Expense,
             amount: "98.01".parse().unwrap(),
             date: "2026-09-22".into(),
+            occurred_at: None,
             category: None,
             note: Some("WAL snapshot".into()),
             channel: None,
@@ -267,7 +287,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.sqlite");
         let store = Store::open(&source, true).await.unwrap();
-        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (2, 'failed', 0, X'00', 0)")
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (999, 'failed', 0, X'00', 0)")
             .execute(&store.pool).await.unwrap();
         store.pool.close().await;
         let output = directory.path().join("restored.sqlite");

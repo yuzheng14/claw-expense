@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use tempfile::TempDir;
 
 const CATEGORY: &str = "外币测试购物";
@@ -281,8 +282,8 @@ fn twd_backup_restore_and_export_preserve_amounts_precision_and_request_history(
     restored(&["export", "--output", export.to_str().unwrap()]);
     let exported: Value = serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
     assert_eq!(
-        exported["amount_units"]["pending_expenses.amount_minor"]["exponents"]["TWD"],
-        2
+        exported["amount_units"]["pending_expenses.amount_minor"],
+        json!({"currency_column": "currency", "unit": "currency_hundredth", "exponent": 2})
     );
     let rows = exported["tables"]["pending_expenses"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -432,7 +433,8 @@ fn foreign_amount_precision_and_i128_totals_are_exact() {
         ("USD", "NaN"),
         ("USD", "0"),
         ("USD", "92233720368547758.08"),
-        ("JPY", "9223372036854775808"),
+        ("JPY", "92233720368547759"),
+        ("KRW", "92233720368547759"),
         ("ZZZ", "1"),
     ] {
         ledger.error(&[
@@ -448,27 +450,202 @@ fn foreign_amount_precision_and_i128_totals_are_exact() {
     }
     assert_eq!(ledger.ok(&["pending", "list"])["total"], 0);
     let maximum_usd = "92233720368547758.07";
-    let maximum_jpy = "9223372036854775807";
+    let maximum_integer_currency = "92233720368547758";
     for _ in 0..2 {
         assert_eq!(
             ledger.add("USD", maximum_usd, "2026-09-01")["pending"]["amount"],
             maximum_usd
         );
-        assert_eq!(
-            ledger.add("JPY", maximum_jpy, "2026-09-01")["pending"]["amount"],
-            maximum_jpy
-        );
+        for currency in ["JPY", "KRW"] {
+            assert_eq!(
+                ledger.add(currency, maximum_integer_currency, "2026-09-01")["pending"]["amount"],
+                maximum_integer_currency
+            );
+        }
     }
     let summary = ledger.ok(&["summary"]);
     assert_eq!(
         currency_total(&summary, "USD")["amount"],
         "184467440737095516.14"
     );
-    assert_eq!(
-        currency_total(&summary, "JPY")["amount"],
-        "18446744073709551614"
-    );
+    for currency in ["JPY", "KRW"] {
+        assert_eq!(
+            currency_total(&summary, currency)["amount"],
+            "184467440737095516"
+        );
+    }
     assert_eq!(summary["expense"], "0.00");
+}
+
+async fn read_only_connection(db: &Path) -> SqliteConnection {
+    SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(db).read_only(true))
+        .await
+        .unwrap()
+}
+
+async fn stored_write_counts(db: &Path) -> (i64, i64, i64, i64, i64) {
+    let mut connection = read_only_connection(db).await;
+    let counts = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM pending_expenses), (SELECT COUNT(*) FROM pending_audit_log), (SELECT COUNT(*) FROM idempotency), (SELECT COUNT(*) FROM transactions), (SELECT COUNT(*) FROM audit_log)",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    counts
+}
+
+#[tokio::test]
+async fn integer_currencies_store_hundredths_but_display_whole_units_and_replay_leading_zeroes() {
+    let ledger = Ledger::new();
+    let mut ids = Vec::new();
+    for currency in ["JPY", "KRW"] {
+        let request_id = format!("integer-{currency}");
+        let args = |amount| {
+            [
+                "pending",
+                "add",
+                "--currency",
+                currency,
+                "--amount",
+                amount,
+                "--date",
+                "2026-09-24",
+                "--category",
+                CATEGORY,
+                "--request-id",
+                request_id.as_str(),
+            ]
+        };
+        let added = ledger.ok(&args("1000"));
+        assert_eq!(added["pending"]["amount"], "1000");
+        let repeated = ledger.ok(&args("0001000"));
+        assert_eq!(repeated["replayed"], true);
+        assert_eq!(repeated["pending"], added["pending"]);
+        let record = json!({
+            "currency": currency, "amount": "001000", "date": "2026-09-24", "category": CATEGORY
+        });
+        let repeated_json = success(run_at(
+            &ledger.db,
+            &["pending", "record", "--request-id", &request_id],
+            Some(&record.to_string()),
+        ));
+        assert_eq!(repeated_json["replayed"], true);
+        assert_eq!(repeated_json["pending"], added["pending"]);
+        ids.push((currency, pending_id(&added).to_owned()));
+    }
+    assert_eq!(stored_write_counts(&ledger.db).await, (2, 2, 2, 0, 0));
+    let mut connection = read_only_connection(&ledger.db).await;
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT currency, amount_minor, typeof(amount_minor) FROM pending_expenses ORDER BY currency",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("JPY".to_owned(), 100000, "integer".to_owned()),
+            ("KRW".to_owned(), 100000, "integer".to_owned()),
+        ]
+    );
+    connection.close().await.unwrap();
+    let summary = ledger.ok(&["summary"]);
+    for currency in ["JPY", "KRW"] {
+        assert_eq!(currency_total(&summary, currency)["amount"], "1000");
+    }
+
+    let backup = ledger.directory.path().join("integer-backup.sqlite3");
+    ledger.ok(&["backup", "--output", backup.to_str().unwrap()]);
+    let restored_db = ledger.directory.path().join("integer-restored.sqlite3");
+    success(run_at(
+        &restored_db,
+        &["restore", "--input", backup.to_str().unwrap()],
+        None,
+    ));
+    let restored = |args: &[&str]| success(run_at(&restored_db, args, None));
+    assert_eq!(restored(&["summary"]), summary);
+    assert_eq!(stored_write_counts(&restored_db).await, (2, 2, 2, 0, 0));
+    let export = ledger.directory.path().join("integer-export.json");
+    restored(&["export", "--output", export.to_str().unwrap()]);
+    let exported: Value = serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
+    assert_eq!(
+        exported["amount_units"]["pending_expenses.amount_minor"],
+        json!({"currency_column": "currency", "unit": "currency_hundredth", "exponent": 2})
+    );
+    let rows = exported["tables"]["pending_expenses"].as_array().unwrap();
+    for (currency, id) in ids {
+        let row = rows.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(row["currency"], currency);
+        assert_eq!(row["amount_minor"], "100000");
+        assert_eq!(
+            restored(&["pending", "show", &id])["pending"]["amount"],
+            "1000"
+        );
+        let request_id = format!("integer-{currency}");
+        let record = json!({
+            "currency": currency, "amount": "0001000", "date": "2026-09-24", "category": CATEGORY
+        });
+        let replayed = success(run_at(
+            &restored_db,
+            &["pending", "record", "--request-id", &request_id],
+            Some(&record.to_string()),
+        ));
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(replayed["pending"]["id"], id);
+    }
+    assert_eq!(stored_write_counts(&restored_db).await, (2, 2, 2, 0, 0));
+}
+
+#[tokio::test]
+async fn integer_currencies_reject_decimal_syntax_without_record_audit_or_request_side_effects() {
+    let ledger = Ledger::new();
+    for currency in ["JPY", "KRW"] {
+        for (index, amount) in ["1.0", "1.00", "1000.00", "0.01", "1.", "92233720368547759"]
+            .into_iter()
+            .enumerate()
+        {
+            let request_id = format!("rejected-{currency}-{index}");
+            ledger.error(&[
+                "pending",
+                "add",
+                "--currency",
+                currency,
+                "--amount",
+                amount,
+                "--date",
+                "2026-09-24",
+                "--category",
+                CATEGORY,
+                "--request-id",
+                &request_id,
+            ]);
+            let record = json!({
+                "currency": currency, "amount": amount, "date": "2026-09-24", "category": CATEGORY
+            });
+            failure(run_at(
+                &ledger.db,
+                &["pending", "record", "--request-id", &request_id],
+                Some(&record.to_string()),
+            ));
+            assert_eq!(stored_write_counts(&ledger.db).await, (0, 0, 0, 0, 0));
+        }
+    }
+    let accepted = ledger.ok(&[
+        "pending",
+        "add",
+        "--currency",
+        "JPY",
+        "--amount",
+        "1000",
+        "--date",
+        "2026-09-24",
+        "--request-id",
+        "rejected-JPY-0",
+    ]);
+    assert_eq!(accepted["replayed"], false);
+    assert_eq!(accepted["pending"]["amount"], "1000");
+    assert_eq!(stored_write_counts(&ledger.db).await, (1, 1, 1, 0, 0));
 }
 
 #[test]

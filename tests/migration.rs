@@ -477,6 +477,107 @@ async fn upgraded_v0_1_0_supports_twd_and_times_with_indexes_triggers_and_foreig
 }
 
 #[tokio::test]
+async fn upgraded_v0_1_0_rejects_fractional_jpy_and_krw_storage_without_mutating_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("whole-currency.sqlite");
+    let old = legacy_store(&path).await;
+    seed_legacy_transaction(&old, legacy_expense(), "txn_legacy", Some("legacy-create")).await;
+    let legacy = legacy_snapshot(&old).await;
+    old.pool.close().await;
+    let upgraded = Store::open(&path, false).await.unwrap();
+    assert_eq!(legacy_snapshot(&upgraded).await, legacy);
+    let usd = upgraded
+        .add_pending(pending_expense("USD", "1.01"), Some("usd-create"))
+        .await
+        .unwrap();
+    let mut whole_currency_ids = Vec::new();
+    for currency in ["JPY", "KRW"] {
+        let result = upgraded
+            .add_pending(
+                pending_expense(currency, "1000"),
+                Some(&format!("{currency}-create")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.pending.amount, "1000");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT amount_minor FROM pending_expenses WHERE id = ?")
+                .bind(&result.pending.id)
+                .fetch_one(&upgraded.pool)
+                .await
+                .unwrap(),
+            100000
+        );
+        whole_currency_ids.push((currency, result.pending.id));
+    }
+    let before_path = directory.path().join("before-rejected-writes.json");
+    archive::export(&upgraded, &before_path).await.unwrap();
+    let before: Value = serde_json::from_slice(&fs::read(&before_path).unwrap()).unwrap();
+    for (currency, id) in &whole_currency_ids {
+        for invalid_amount in [1_i64, 101, 100001, i64::MAX] {
+            let insert = sqlx::query("INSERT INTO pending_expenses (id, currency, amount_minor, date, category, remind_on, created_at, updated_at) VALUES ('invalid-whole-currency', ?, ?, '2026-09-28', '购物', '2026-10-01', '2026-09-28T12:00:00Z', '2026-09-28T12:00:00Z')")
+                .bind(currency).bind(invalid_amount).execute(&upgraded.pool).await.unwrap_err();
+            assert!(
+                insert.to_string().contains("CHECK constraint failed"),
+                "{currency} INSERT {invalid_amount}: {insert}"
+            );
+            let update = sqlx::query("UPDATE pending_expenses SET amount_minor = ? WHERE id = ?")
+                .bind(invalid_amount)
+                .bind(id)
+                .execute(&upgraded.pool)
+                .await
+                .unwrap_err();
+            assert!(
+                update.to_string().contains("CHECK constraint failed"),
+                "{currency} UPDATE {invalid_amount}: {update}"
+            );
+        }
+        // A currency-only edit must not reinterpret an existing fractional USD
+        // amount as whole JPY/KRW, even when the numeric column is unchanged.
+        let switch = sqlx::query("UPDATE pending_expenses SET currency = ? WHERE id = ?")
+            .bind(currency)
+            .bind(&usd.pending.id)
+            .execute(&upgraded.pool)
+            .await
+            .unwrap_err();
+        assert!(
+            switch.to_string().contains("CHECK constraint failed"),
+            "USD -> {currency}: {switch}"
+        );
+        let simultaneous = sqlx::query(
+            "UPDATE pending_expenses SET currency = ?, amount_minor = 199 WHERE id = ?",
+        )
+        .bind(currency)
+        .bind(&usd.pending.id)
+        .execute(&upgraded.pool)
+        .await
+        .unwrap_err();
+        assert!(
+            simultaneous.to_string().contains("CHECK constraint failed"),
+            "USD -> {currency} with amount: {simultaneous}"
+        );
+    }
+    let after_path = directory.path().join("after-rejected-writes.json");
+    archive::export(&upgraded, &after_path).await.unwrap();
+    let after: Value = serde_json::from_slice(&fs::read(&after_path).unwrap()).unwrap();
+    // Covers every row, historical audit JSON and idempotency response, not only
+    // the monetary column targeted by the rejected SQL statements.
+    assert_eq!(after["tables"], before["tables"]);
+    assert_eq!(
+        legacy_snapshot(&upgraded).await["transactions"],
+        legacy["transactions"]
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&upgraded.pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    upgraded.pool.close().await;
+}
+
+#[tokio::test]
 async fn new_cli_restores_a_v0_1_0_backup_without_modifying_the_source() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("legacy-backup.sqlite");
@@ -574,7 +675,7 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
     let store = Store::open(&directory.path().join("live.sqlite"), true)
         .await
         .unwrap();
-    let jpy_input = pending_expense("JPY", "9223372036854775807");
+    let jpy_input = pending_expense("JPY", "92233720368547758");
     let jpy = store
         .add_pending(jpy_input.clone(), Some("jpy-create"))
         .await
@@ -587,6 +688,26 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
         .add_pending(pending_expense("USD", "20.00"), Some("usd-create"))
         .await
         .unwrap();
+    let krw_input = pending_expense("KRW", "1000");
+    let krw = store
+        .add_pending(krw_input.clone(), Some("krw-create"))
+        .await
+        .unwrap();
+    assert_eq!(jpy.pending.amount, "92233720368547758");
+    assert_eq!(krw.pending.amount, "1000");
+    let raw_amounts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT currency, amount_minor FROM pending_expenses ORDER BY currency")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        raw_amounts,
+        [
+            ("JPY".into(), 9223372036854775800),
+            ("KRW".into(), 100000),
+            ("USD".into(), 2000),
+        ]
+    );
     let confirmation = ConfirmPendingExpense {
         amount: "143.29".parse().unwrap(),
         posted_date: Some("2026-10-03".into()),
@@ -620,17 +741,16 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
         "CNY"
     );
     assert_eq!(
-        exported["amount_units"]["pending_expenses.amount_minor"]["exponents"]["JPY"],
-        0
-    );
-    assert_eq!(
-        exported["amount_units"]["pending_expenses.amount_minor"]["exponents"]["USD"],
-        2
+        exported["amount_units"]["pending_expenses.amount_minor"],
+        json!({
+            "currency_column": "currency", "unit": "currency_hundredth", "exponent": 2
+        })
     );
     let rows = exported["tables"]["pending_expenses"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     let find = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
-    assert_eq!(find(&jpy.pending.id)["amount_minor"], "9223372036854775807");
+    assert_eq!(find(&jpy.pending.id)["amount_minor"], "9223372036854775800");
+    assert_eq!(find(&krw.pending.id)["amount_minor"], "100000");
     assert_eq!(find(&jpy.pending.id)["remind_on"], "2026-10-06");
     assert!(find(&jpy.pending.id)["confirmed_amount_minor"].is_null());
     assert_eq!(find(&usd.pending.id)["amount_minor"], "2000");
@@ -643,12 +763,12 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
             .as_array()
             .unwrap()
             .len(),
-        6
+        7
     );
     assert_eq!(exported["tables"]["audit_log"].as_array().unwrap().len(), 1);
     assert_eq!(
         exported["tables"]["idempotency"].as_array().unwrap().len(),
-        6
+        7
     );
 
     let backup_path = directory.path().join("backup.sqlite");
@@ -673,6 +793,23 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
         .unwrap();
     assert!(repeated_jpy.replayed);
     assert_eq!(repeated_jpy.pending.id, jpy.pending.id);
+    assert_eq!(repeated_jpy.pending.amount, "92233720368547758");
+    let repeated_krw = restored
+        .add_pending(krw_input, Some("krw-create"))
+        .await
+        .unwrap();
+    assert!(repeated_krw.replayed);
+    assert_eq!(repeated_krw.pending.id, krw.pending.id);
+    assert_eq!(repeated_krw.pending.amount, "1000");
+    for (id, amount) in [
+        (&jpy.pending.id, "92233720368547758"),
+        (&krw.pending.id, "1000"),
+    ] {
+        assert_eq!(
+            restored.get_pending(id).await.unwrap().pending.amount,
+            amount
+        );
+    }
     let repeated_confirm = restored
         .confirm_pending(&usd.pending.id, confirmation, Some("usd-confirm"))
         .await
@@ -708,7 +845,7 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
             .fetch_one(&restored.pool)
             .await
             .unwrap(),
-        3
+        4
     );
     restored.pool.close().await;
     store.pool.close().await;

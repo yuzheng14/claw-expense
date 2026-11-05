@@ -10,8 +10,8 @@ use claw_expense::{
     archive,
     error::{AppError, Result},
     models::{
-        ConfirmPendingExpense, Filters, Kind, NewPendingExpense, NewTransaction, PendingFilters,
-        UpdateTransaction,
+        ConfirmInstallment, ConfirmPendingExpense, Filters, InstallmentFilters, Kind,
+        NewInstallment, NewPendingExpense, NewTransaction, PendingFilters, UpdateTransaction,
     },
     money::Money,
     occurrence::date_from_occurred_at,
@@ -91,7 +91,7 @@ struct FilterArgs {
     to: Option<String>,
     #[arg(long)]
     category: Option<String>,
-    #[arg(long, help = "按 ID、备注、渠道或外币消费商户查找")]
+    #[arg(long, help = "按 ID、备注、渠道或外币/分期商户查找")]
     search: Option<String>,
 }
 
@@ -225,6 +225,101 @@ enum PendingCommand {
     History { id: String },
 }
 
+#[derive(Args)]
+struct InstallmentListArgs {
+    #[command(flatten)]
+    filter: FilterArgs,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(i64).range(1..=1000))]
+    limit: i64,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    offset: i64,
+}
+
+impl InstallmentListArgs {
+    fn filters(self) -> Filters {
+        let mut filters = self.filter.filters();
+        filters.limit = self.limit;
+        filters.offset = self.offset;
+        filters
+    }
+}
+
+#[derive(Subcommand)]
+enum InstallmentCommand {
+    /// 建立按月分期计划；未确认期数不计入收支
+    Add {
+        #[arg(long, help = "总本金，人民币正数，最多两位小数")]
+        amount: Money,
+        #[arg(
+            long,
+            default_value = "0",
+            help = "全部期数的总手续费，默认免息免手续费；不输入利率"
+        )]
+        fee: Money,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(2..=360))]
+        periods: u32,
+        #[arg(long, help = "首期应还日期 YYYY-MM-DD；之后每月同日，短月取月末")]
+        first_due_date: String,
+        #[arg(long, help = "消费日期；省略时从 occurred-at 推导，否则本机今天")]
+        date: Option<String>,
+        #[arg(long)]
+        occurred_at: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        merchant: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 从 stdin 或文件读取分期 JSON；金额为字符串，消费及首期日期必填
+    Record {
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 查询分期计划，默认仅进行中；日期筛选按消费日期
+    List {
+        #[command(flatten)]
+        query: InstallmentListArgs,
+        #[arg(long, value_parser = ["active", "completed", "cancelled", "all"])]
+        status: Option<String>,
+    },
+    /// 查询到期且未确认的期数，日期筛选按应还日期；只读
+    Due {
+        #[command(flatten)]
+        query: InstallmentListArgs,
+        #[arg(long, default_value_t = today())]
+        as_of: String,
+    },
+    /// 查看完整排期、剩余金额与已入账记录
+    Show { id: String },
+    /// 将指定期数的本金和手续费合计记为一笔人民币支出
+    Confirm {
+        id: String,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=360))]
+        period: u32,
+        #[arg(long, help = "实际扣款日期；省略时从 occurred-at 推导，否则本机今天")]
+        date: Option<String>,
+        #[arg(long, help = "实际扣款时间，须含时区偏移")]
+        occurred_at: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 取消剩余未确认期数，保留已入账支出和历史；不会执行银行操作
+    Cancel {
+        id: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// 查看计划创建、逐期确认和取消历史
+    History { id: String },
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// 初始化本地账本（人民币）
@@ -314,6 +409,11 @@ enum Command {
     Pending {
         #[command(subcommand)]
         command: PendingCommand,
+    },
+    /// 管理人民币按月分期账单
+    Installment {
+        #[command(subcommand)]
+        command: InstallmentCommand,
     },
     /// 完整导出 JSON（包含作废记录、审计和请求标识），不覆盖文件
     Export {
@@ -488,13 +588,14 @@ async fn execute(store: &Store, command: Command, db: &std::path::Path) -> Resul
             )?),
         },
         Command::Pending { command } => execute_pending(store, command).await,
+        Command::Installment { command } => execute_installment(store, command).await,
         Command::Backup { output } => {
             archive::backup(store, &output).await?;
             Ok(json!({"output": output, "format": "sqlite"}))
         }
         Command::Export { output } => {
             archive::export(store, &output).await?;
-            Ok(json!({"output": output, "format": "claw-expense-export", "version": 2}))
+            Ok(json!({"output": output, "format": "claw-expense-export", "version": 3}))
         }
         Command::Restore { .. } => {
             unreachable!("restore is handled before opening the destination")
@@ -578,6 +679,86 @@ async fn execute_pending(store: &Store, command: PendingCommand) -> Result<Value
     }
 }
 
+async fn execute_installment(store: &Store, command: InstallmentCommand) -> Result<Value> {
+    match command {
+        InstallmentCommand::Add {
+            amount,
+            fee,
+            periods,
+            first_due_date,
+            date,
+            occurred_at,
+            category,
+            merchant,
+            note,
+            channel,
+            request_id,
+        } => Ok(serde_json::to_value(
+            store
+                .add_installment(
+                    NewInstallment {
+                        amount,
+                        fee,
+                        periods,
+                        first_due_date,
+                        date: entry_date(date, occurred_at.as_deref())?,
+                        occurred_at,
+                        category,
+                        merchant,
+                        note,
+                        channel,
+                    },
+                    request_id.as_deref(),
+                )
+                .await?,
+        )?),
+        InstallmentCommand::Record { input, request_id } => Ok(serde_json::to_value(
+            store
+                .add_installment(read_json(input)?, request_id.as_deref())
+                .await?,
+        )?),
+        InstallmentCommand::List { query, status } => Ok(serde_json::to_value(
+            store
+                .list_installments(&InstallmentFilters {
+                    filters: query.filters(),
+                    status,
+                })
+                .await?,
+        )?),
+        InstallmentCommand::Due { query, as_of } => Ok(serde_json::to_value(
+            store.due_installments(&query.filters(), &as_of).await?,
+        )?),
+        InstallmentCommand::Show { id } => {
+            Ok(serde_json::to_value(store.get_installment(&id).await?)?)
+        }
+        InstallmentCommand::Confirm {
+            id,
+            period,
+            date,
+            occurred_at,
+            request_id,
+        } => Ok(serde_json::to_value(
+            store
+                .confirm_installment(
+                    &id,
+                    period,
+                    ConfirmInstallment {
+                        date: entry_date(date, occurred_at.as_deref())?,
+                        occurred_at,
+                    },
+                    request_id.as_deref(),
+                )
+                .await?,
+        )?),
+        InstallmentCommand::Cancel { id, request_id } => Ok(serde_json::to_value(
+            store.cancel_installment(&id, request_id.as_deref()).await?,
+        )?),
+        InstallmentCommand::History { id } => {
+            Ok(serde_json::to_value(store.installment_history(&id).await?)?)
+        }
+    }
+}
+
 fn cell(value: &Value, key: &str) -> String {
     let text = value.get(key).and_then(Value::as_str).unwrap_or("");
     text.chars()
@@ -638,7 +819,81 @@ fn pending_line(entry: &Value) -> String {
     text
 }
 
+fn plan_line(plan: &Value) -> String {
+    let status = match plan["status"].as_str() {
+        Some("completed") => "已完成",
+        Some("cancelled") => "已取消",
+        _ => "进行中",
+    };
+    format!(
+        "{}  {}  {}  本金 {} 元 + 手续费 {} 元 = {} 元 / {} 期  [{}]",
+        cell(plan, "id"),
+        occurrence_label(plan),
+        cell(plan, "merchant"),
+        cell(plan, "amount"),
+        cell(plan, "fee"),
+        cell(plan, "total"),
+        plan["periods"],
+        status
+    )
+}
+
+fn installment_line(item: &Value) -> String {
+    let status = match item["status"].as_str() {
+        Some("confirmed") => "已确认",
+        Some("cancelled") => "已取消",
+        _ => "待确认",
+    };
+    let mut text = format!(
+        "第 {} 期  {}  {} 元（本金 {} + 手续费 {}）[{}]",
+        item["period"],
+        cell(item, "due_date"),
+        cell(item, "amount"),
+        cell(item, "principal"),
+        cell(item, "fee"),
+        status
+    );
+    if item["transaction_id"].is_string() {
+        text.push_str(&format!(
+            "  {}  扣款日 {}",
+            cell(item, "transaction_id"),
+            cell(item, "confirmed_date")
+        ));
+    }
+    text
+}
+
 fn human_output(data: &Value) -> Result<String> {
+    if let Some(plan) = data.get("plan") {
+        let mut text = plan_line(plan);
+        text.push_str(&format!(
+            "\n已确认 {} 期 | 剩余 {} 期，共 {} 元\n",
+            data["confirmed_count"],
+            data["remaining_count"],
+            cell(data, "remaining_amount")
+        ));
+        for item in data["schedule"].as_array().into_iter().flatten() {
+            text.push_str(&installment_line(item));
+            text.push('\n');
+        }
+        if data["replayed"] == true {
+            text.push_str("此前已处理，未重复执行；当前状态请用 installment show 查询。\n");
+        }
+        if data.get("transaction").is_some_and(Value::is_object) {
+            text.push_str("关联人民币账单：\n");
+            text.push_str(&entry_line(&data["transaction"]));
+            text.push('\n');
+        }
+        for item in data["transactions"].as_array().into_iter().flatten() {
+            if item["voided"] == true {
+                text.push_str(&format!(
+                    "{} 已作废；排期保留原确认记录。\n",
+                    cell(item, "id")
+                ));
+            }
+        }
+        return Ok(text);
+    }
     if let Some(pending) = data.get("pending") {
         let mut text = pending_line(pending);
         text.push('\n');
@@ -661,7 +916,16 @@ fn human_output(data: &Value) -> Result<String> {
     if let Some(items) = data.get("items").and_then(Value::as_array) {
         let mut text = format!("共 {} 笔，当前显示 {} 笔\n", data["total"], items.len());
         for item in items {
-            if item.get("status").is_some() {
+            if item.get("plan_id").is_some() {
+                text.push_str(&format!(
+                    "{}  {}  {}",
+                    cell(item, "plan_id"),
+                    cell(item, "merchant"),
+                    installment_line(item)
+                ));
+            } else if item.get("periods").is_some() {
+                text.push_str(&plan_line(item));
+            } else if item.get("status").is_some() {
                 text.push_str(&pending_line(item));
             } else {
                 text.push_str(&entry_line(item));
@@ -716,6 +980,13 @@ fn human_output(data: &Value) -> Result<String> {
             text.push_str("原币消费：\n");
             text.push_str(&pending_line(&data["foreign_expense"]));
             text.push('\n');
+        }
+        if data.get("installment").is_some_and(Value::is_object) {
+            text.push_str(&format!(
+                "分期计划 {}：{}\n",
+                cell(&data["installment"], "plan_id"),
+                installment_line(&data["installment"])
+            ));
         }
         if let Some(total) = data.get("refund_total") {
             text.push_str(&format!("累计退回 {} 元", total.as_str().unwrap_or("0.00")));

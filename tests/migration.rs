@@ -361,7 +361,7 @@ async fn upgraded_v0_1_0_supports_twd_and_times_with_indexes_triggers_and_foreig
             .fetch_all(&upgraded.pool)
             .await
             .unwrap();
-    assert_eq!(versions, [1, 2]);
+    assert_eq!(versions, [1, 2, 3]);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
             .fetch_one(&upgraded.pool)
@@ -728,7 +728,7 @@ async fn pending_backup_restore_and_export_preserve_units_states_history_and_rep
     let exported_path = directory.path().join("export.json");
     archive::export(&store, &exported_path).await.unwrap();
     let exported: Value = serde_json::from_slice(&fs::read(&exported_path).unwrap()).unwrap();
-    assert_eq!(exported["version"], 2);
+    assert_eq!(exported["version"], 3);
     assert_eq!(exported["base_currency"], "CNY");
     assert_eq!(exported["integer_encoding"], "decimal_string");
     assert!(exported.get("amount_unit").is_none());
@@ -962,4 +962,85 @@ async fn occurrence_offsets_and_local_dates_survive_confirmation_export_backup_a
     assert_eq!(summary.pending_count, 0);
     restored.pool.close().await;
     store.pool.close().await;
+}
+
+#[tokio::test]
+async fn v0_2_backup_restores_then_upgrades_without_rewriting_existing_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v0.2.sqlite");
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true),
+    )
+    .await
+    .unwrap();
+    let migrations = sqlx::migrate!()
+        .iter()
+        .filter(|m| m.version <= 2)
+        .cloned()
+        .collect();
+    Migrator::with_migrations(migrations)
+        .run(&pool)
+        .await
+        .unwrap();
+    let old = Store { pool };
+    let input = legacy_expense();
+    let added = old.add(input.clone(), Some("v0.2-create")).await.unwrap();
+    let snapshot = legacy_snapshot(&old).await;
+    let backup = directory.path().join("v0.2-backup.sqlite");
+    archive::backup(&old, &backup).await.unwrap();
+    old.pool.close().await;
+    let target = directory.path().join("restored.sqlite");
+    archive::restore(&backup, &target).await.unwrap();
+    let upgraded = Store::open(&target, false).await.unwrap();
+    assert_eq!(legacy_snapshot(&upgraded).await, snapshot);
+    assert!(
+        upgraded
+            .add(input, Some("v0.2-create"))
+            .await
+            .unwrap()
+            .replayed
+    );
+    let detail = upgraded.get(&added.transaction.id).await.unwrap();
+    assert!(detail.installment.is_none());
+    let plan = serde_json::from_value(json!({"amount":"100", "fee":"0", "periods":3,
+        "date":"2026-11-01", "first_due_date":"2026-11-30"}))
+    .unwrap();
+    assert_eq!(
+        upgraded
+            .add_installment(plan, Some("post-upgrade"))
+            .await
+            .unwrap()
+            .detail
+            .schedule
+            .len(),
+        3
+    );
+    upgraded.pool.close().await;
+    let source = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&source)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'installment_plans'"
+        )
+        .fetch_one(&source)
+        .await
+        .unwrap(),
+        0
+    );
+    source.close().await;
 }

@@ -328,6 +328,7 @@ impl Store {
             (None, None, 0)
         };
         let foreign_expense = crate::foreign::find_by_transaction(&mut tx, id).await?;
+        let installment = crate::installments::find_by_transaction(&mut tx, id).await?;
         tx.commit().await?;
         Ok(TransactionDetail {
             transaction,
@@ -337,6 +338,7 @@ impl Store {
             refund_status: status,
             excess_refund: format_minor(excess),
             foreign_expense,
+            installment,
         })
     }
 
@@ -608,6 +610,10 @@ fn push_filters(query: &mut QueryBuilder<Sqlite>, filters: &Filters, include_voi
             .push(") > 0 OR EXISTS (SELECT 1 FROM pending_expenses p WHERE (p.transaction_id = t.id OR p.transaction_id = t.original_id) AND (instr(COALESCE(p.merchant, ''), ")
             .push_bind(keyword)
             .push(") > 0 OR instr(p.id, ")
+            .push_bind(keyword)
+            .push(") > 0)) OR EXISTS (SELECT 1 FROM installment_periods s JOIN installment_plans p ON p.id = s.plan_id WHERE (s.transaction_id = t.id OR s.transaction_id = t.original_id) AND (instr(p.id, ")
+            .push_bind(keyword)
+            .push(") > 0 OR instr(COALESCE(p.merchant, ''), ")
             .push_bind(keyword)
             .push(") > 0)))");
     }

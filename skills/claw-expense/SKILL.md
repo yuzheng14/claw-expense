@@ -1,6 +1,6 @@
 ---
 name: claw-expense
-description: 使用 claw-expense CLI 记录人民币收支、关联退款及待确认人民币金额的外币消费，查询或修正账单。适用于日常记账、代付报销、外币账单补录和待确认提醒。
+description: 使用 claw-expense CLI 记录人民币收支、关联退款、分期账单及待确认人民币金额的外币消费，查询或修正账单。适用于日常记账、代付报销、外币账单补录和待确认提醒。
 license: MIT
 metadata:
   openclaw:
@@ -63,6 +63,10 @@ bash "{baseDir}/scripts/run.sh" --json list --month 2026-09
 ```
 
 退款省略 `category`，分类继承原支出；收款渠道独立于原支付渠道。允许部分、多次以及超额退款：支出 98 元、退回 100 元，净支出为 -2 元，不拆成额外收入。
+
+## 分期账单
+
+用户要记录按月分期、查看后续账单或确认某期扣款时，读取 [references/installments.md](references/installments.md)。首次使用先通过包装脚本运行 `installment --help` 检查能力；旧版不支持时提示升级，不能把未来分期一次性记为已发生支出。
 
 ## 外币待确认账单
 

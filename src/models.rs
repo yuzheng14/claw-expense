@@ -100,6 +100,8 @@ pub struct TransactionDetail {
     pub excess_refund: String,
     #[serde(default)]
     pub foreign_expense: Option<PendingExpenseRecord>,
+    #[serde(default)]
+    pub installment: Option<InstallmentPeriod>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -254,4 +256,130 @@ pub struct AuditRecord {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewInstallment {
+    pub amount: Money,
+    #[serde(default = "default_installment_fee")]
+    pub fee: Money,
+    pub periods: u32,
+    pub date: String,
+    pub first_due_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    pub category: Option<String>,
+    pub merchant: Option<String>,
+    pub note: Option<String>,
+    pub channel: Option<String>,
+}
+
+fn default_installment_fee() -> Money {
+    Money::from_minor(0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallmentPlan {
+    pub id: String,
+    pub amount: Money,
+    pub fee: Money,
+    pub total: String,
+    pub currency: String,
+    pub periods: u32,
+    pub date: String,
+    pub occurred_at: Option<String>,
+    pub first_due_date: String,
+    pub category: String,
+    pub merchant: Option<String>,
+    pub note: Option<String>,
+    pub channel: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallmentPeriod {
+    pub plan_id: String,
+    pub period: u32,
+    pub due_date: String,
+    pub principal: Money,
+    pub fee: Money,
+    pub amount: Money,
+    pub status: String,
+    pub transaction_id: Option<String>,
+    pub confirmed_date: Option<String>,
+    pub confirmed_occurred_at: Option<String>,
+    pub confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallmentDetail {
+    pub plan: InstallmentPlan,
+    pub schedule: Vec<InstallmentPeriod>,
+    pub confirmed_count: usize,
+    pub remaining_count: usize,
+    pub remaining_amount: String,
+    // Current records, including later corrections or voids; schedule keeps confirmation facts.
+    pub transactions: Vec<TransactionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallmentWriteResult {
+    #[serde(flatten)]
+    pub detail: InstallmentDetail,
+    pub transaction: Option<TransactionRecord>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmInstallment {
+    pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+}
+
+pub struct InstallmentFilters {
+    pub filters: Filters,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallmentList {
+    pub items: Vec<InstallmentPlan>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallmentDue {
+    #[serde(flatten)]
+    pub installment: InstallmentPeriod,
+    pub periods: u32,
+    pub category: String,
+    pub merchant: Option<String>,
+    pub note: Option<String>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallmentDueList {
+    pub items: Vec<InstallmentDue>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub as_of: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallmentAudit {
+    pub id: i64,
+    pub plan_id: String,
+    pub action: String,
+    pub before: Option<serde_json::Value>,
+    pub after: serde_json::Value,
+    pub created_at: String,
 }

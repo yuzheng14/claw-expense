@@ -161,6 +161,18 @@ pub async fn export(store: &Store, output: &Path) -> Result<()> {
             "SELECT * FROM pending_audit_log ORDER BY id",
         ),
         (
+            "installment_plans",
+            "SELECT * FROM installment_plans ORDER BY id",
+        ),
+        (
+            "installment_periods",
+            "SELECT * FROM installment_periods ORDER BY plan_id, period",
+        ),
+        (
+            "installment_audit_log",
+            "SELECT * FROM installment_audit_log ORDER BY id",
+        ),
+        (
             "idempotency",
             "SELECT * FROM idempotency ORDER BY request_id",
         ),
@@ -198,9 +210,13 @@ pub async fn export(store: &Store, output: &Path) -> Result<()> {
     transaction.commit().await?;
     let document = json!({
         "format": "claw-expense-export",
-        "version": 2,
+        "version": 3,
         "base_currency": "CNY",
         "amount_units": {
+            "installment_plans.amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
+            "installment_plans.fee_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
+            "installment_periods.principal_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
+            "installment_periods.fee_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
             "transactions.amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
             "pending_expenses.confirmed_amount_minor": { "currency": "CNY", "unit": "fen", "exponent": 2 },
             "pending_expenses.amount_minor": {

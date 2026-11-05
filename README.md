@@ -1,6 +1,6 @@
 # claw-expense
 
-给 OpenClaw 和人使用的本地记账 CLI。Rust + Clap + SQLx + SQLite，处理人民币收支、关联退款、外币待确认消费和查询汇总。
+给 OpenClaw 和人使用的本地记账 CLI。Rust + Clap + SQLx + SQLite，处理人民币收支、关联退款、分期账单、外币待确认消费和查询汇总。
 
 ## 安装 Skill（推荐）
 
@@ -138,6 +138,49 @@ claw-expense show txn_实际ID
 - 退款的收款渠道可以与原支付渠道不同；退款分类继承原支出，不能单独指定。
 - 月报按每笔支出和退款各自的实际发生日期统计。上例 8 月支出 `98.00`，9 月退款 `100.00`、净支出 `-100.00`。
 - 原支出修改分类后，关联退款显示及分类汇总随之变化。修改金额后出现超额退款是合法的。
+
+## 分期账单
+
+分期计划保存总本金、**总手续费**和按月排期；只有实际扣款后确认的期数才生成人民币支出。未来期数不计入 `list` / `summary`，购买当天也不额外记一次总支出。
+
+```bash
+# 1000.01 元本金，3 期，总手续费 1.01 元；不输入利率
+claw-expense installment add --amount 1000.01 --fee 1.01 --periods 3 \
+  --date 2026-01-20 --first-due-date 2026-01-31 \
+  --category 购物 --merchant 手机商店 --channel 信用卡 \
+  --request-id msg-301-installment-1 --json
+
+# 用返回的 plan.id 替换 <分期ID>
+claw-expense installment show <分期ID>
+claw-expense installment list --status all --json
+claw-expense installment due --as-of 2026-02-28 --json
+
+# 实际在 2 月 1 日扣款，第一期支出归 2 月；应还日期仍保留 1 月 31 日
+claw-expense installment confirm <分期ID> --period 1 \
+  --occurred-at '2026-02-01T00:05+08:00' \
+  --request-id msg-302-confirm-1 --json
+claw-expense summary --month 2026-02
+claw-expense installment history <分期ID> --json
+
+# 取消所有剩余未确认期数，保留已确认的支出及其退款
+claw-expense installment cancel <分期ID> --request-id msg-303-cancel-1 --json
+```
+
+- 仅支持人民币、按月等本金与等手续费排期，2–360 期。`amount` 是总本金，`fee` 是全部期数的总手续费，省略为 `0.00`；不推算利率或浮动利息。本金须足够每期至少一分，单期本金与手续费合计不能超出单笔金额上限。
+- 本金、手续费各自用整数分均分，全部尾差归最后一期；上例前两期各 `333.33 + 0.33 = 333.66` 元，最后一期 `333.35 + 0.35 = 333.70` 元，合计严格为 `1001.02` 元。
+- 首期日期不能早于消费日期。后续日期始终以首期日号为锚点，短月取月末：`2026-01-31 → 2026-02-28 → 2026-03-31`，不会逐月漂移到 28 日。超出年份 9999 的排期直接拒绝。
+- `date` / `occurred_at` 在计划中表示原消费日期/时间，确认时表示本期实际扣款日期/时间；实际日期可早于应还日，但不能早于原消费。CLI 省略日期时从时间推导，否则用本机当天；Agent 应固定实际日期用于重试。
+- 确认生成一笔包含本期本金和手续费的支出，沿用计划分类、备注、渠道；不另记总本金或还款收入。商户保留在计划中，普通 `list --search` / `summary --search` 支持分期 ID、商户及关联退款。`show <人民币账单ID>` 返回 `installment` 关联信息。
+- `installment list` 默认只列 `active` 计划，可选 `completed`、`cancelled`、`all`；日期筛选按原消费日。`due` 仅列进行中计划里应还日不晚于 `--as-of` 的未确认期数，日期筛选按应还日。两者支持分类、搜索、`--month` 或 `--from/--to`、`--limit/--offset`。到期查询只读，不会自动入账或发送提醒；查跨月逾期时不要限定当月。
+- `show` 返回完整 `schedule`、`confirmed_count`、`remaining_count`、`remaining_amount` 和当前关联账单。剩余金额只计算未确认且未取消的排期；确认后发生的退款、金额纠错或作废不会重开排期。`transactions` 显示当前账单状态，`schedule` 保留原确认事实。
+- 创建、确认、取消均支持稳定 `--request-id`，相同载荷重放首次结果快照，变化的载荷返回 `IDEMPOTENCY_CONFLICT`。即使不传请求标识，同一期以相同扣款日期/时间重试也返回原关联账单，不生成第二笔；不同则返回 `ALREADY_CONFIRMED`。并发确认受同一事务和唯一关联保护。
+- 已确认账单继续通过现有 `refund` / `edit` / `void` 处理，均保留审计；取消计划不会替代实际退款，也不会操作银行。计划信息暂不直接编辑，未确认计划填错时取消并重建；部分确认后重建只覆盖剩余金额，避免重复记录已入账期数。已全部确认的计划不能取消。
+
+Agent 可用 `installment record --json --request-id <稳定标识>` 从 stdin 传单个 JSON 对象；未知字段和 JSON 数字金额会被拒绝，`date` 与 `first_due_date` 必填：
+
+```json
+{"amount":"1000.01","fee":"1.01","periods":3,"date":"2026-01-20","first_due_date":"2026-01-31","category":"购物","merchant":"手机商店","channel":"信用卡"}
+```
 
 ## 人民币金额精度
 
@@ -302,7 +345,7 @@ claw-expense --db ./restored.sqlite summary
 
 所有输出和恢复目标都必须是新文件，不覆盖已有文件。恢复前检查应用标识、数据库版本、完整性和外键关系。SQLite 备份包含数据库结构、全部账单、审计历史和请求去重记录；使用一致性快照创建，包含已经提交的 WAL 数据。
 
-JSON 导出 v2 包含 `categories`、`transactions`、`audit_log`、`idempotency`、`pending_expenses`、`pending_audit_log` 六张业务表。人民币 `transactions.amount_minor` 单位为分；外币 `pending_expenses.amount_minor` 统一为原币的百分之一，包括 JPY、KRW。归档的 `amount_units` 对该字段标明 `unit: "currency_hundredth"`、固定 `exponent: 2`，币种取自同一行的 `currency`。归档原始整数和 CLI 返回的原币金额不同：例如存储值 `100000` 对应 `1000 JPY`。所有整数也编码为字符串，以保持大整数精度。JSON 导出暂不提供导入命令，恢复使用 SQLite 备份。
+JSON 导出 v3 包含 `categories`、`transactions`、`audit_log`、`idempotency`、`pending_expenses`、`pending_audit_log`、`installment_plans`、`installment_periods`、`installment_audit_log` 九张业务表。分期本金和手续费字段均为人民币整数分，`amount_units` 标明其单位。人民币 `transactions.amount_minor` 单位为分；外币 `pending_expenses.amount_minor` 统一为原币的百分之一，包括 JPY、KRW。归档的 `amount_units` 对该字段标明 `unit: "currency_hundredth"`、固定 `exponent: 2`，币种取自同一行的 `currency`。归档原始整数和 CLI 返回的原币金额不同：例如存储值 `100000` 对应 `1000 JPY`。所有整数也编码为字符串，以保持大整数精度。JSON 导出暂不提供导入命令，恢复使用 SQLite 备份。
 
 打开 v0.1.0 账本会自动应用新增迁移，不修改旧迁移文件或清空已有数据；建议升级前先备份。旧 SQLite 备份只要迁移记录是当前程序的已知完整前缀且校验正确即可恢复，首次打开恢复后的账本时自动升级。新版本已迁移的账本不支持用旧二进制打开；回退请使用升级前备份，不要手工删迁移记录。
 
@@ -316,7 +359,7 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-`src/money.rs` 管理精确金额；`src/store.rs` 管理账单、事务、幂等、审计和统计；`src/main.rs` 管理 Clap 参数与输出；`src/archive.rs` 管理导出和备份。金额写入、审计和去重记录在同一事务中提交。
+`src/money.rs` 管理精确金额；`src/store.rs` 管理账单、事务、幂等、审计和统计；`src/installments.rs` 管理分期排期与逐期入账；`src/main.rs` 管理 Clap 参数与输出；`src/archive.rs` 管理导出和备份。金额写入、审计和去重记录在同一事务中提交。
 
 测试全部使用临时数据库，不会读写默认账本。暂不包含账户余额、转账、预算、多币种账户或汇率换算、旧软件批量导入、网页或 Server。
 
